@@ -1,0 +1,26 @@
+name: board_dev
+
+services:
+  app:
+    build: .
+    container_name: board_dev_app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8022:8000"
+    environment:
+      - SERVICE_NAME=${SERVICE_NAME}
+      - VERSION=${VERSION:-0.1.0}
+      - DATABASE_URL=${DATABASE_URL}
+      - API_KEY=${API_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/info"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      - shared
+
+networks:
+  shared:
+    external: true

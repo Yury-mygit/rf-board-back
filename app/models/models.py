@@ -1,0 +1,55 @@
+import uuid
+
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    Uuid,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Board(Base):
+    __tablename__ = "boards"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    elements: Mapped[list["BoardElement"]] = relationship(
+        "BoardElement", back_populates="board"
+    )
+
+
+class BoardElement(Base):
+    __tablename__ = "board_elements"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True)
+    board_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(), ForeignKey("boards.id"), nullable=False, index=True
+    )
+    type: Mapped[str] = mapped_column(String(20), nullable=False)
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(), ForeignKey("board_elements.id"), nullable=True, index=True
+    )
+    z_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    x: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    y: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    w: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    h: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    attrs: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    board: Mapped["Board"] = relationship("Board", back_populates="elements")
