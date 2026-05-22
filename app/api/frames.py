@@ -292,9 +292,13 @@ def render_frame_as_html(data: dict) -> str:
         elif c["type"] == "line":
             length = math.hypot(w, h)
             angle = math.degrees(math.atan2(h, w))
+            stroke = a["stroke"] if "stroke" in a else "#212529"
+            if stroke is None:
+                stroke = "transparent"
+            sw = a.get("strokeWidth", 2)
             parts.append(
                 f'  <div style="position: absolute; left: {rx}px; top: {ry}px; '
-                f'width: {length}px; height: 2px; background: #212529; '
+                f'width: {length}px; height: {sw}px; background: {stroke}; '
                 f'transform-origin: 0 50%; transform: rotate({angle:.2f}deg);"></div>'
             )
         elif c["type"] == "image":
@@ -375,9 +379,13 @@ def render_frame_as_svg(data: dict) -> str:
                     f'{html_escape(line)}</text>'
                 )
         elif c["type"] == "line":
+            stroke = a["stroke"] if "stroke" in a else "#212529"
+            if stroke is None:
+                stroke = "none"
+            sw = a.get("strokeWidth", 2)
             out.append(
                 f'<line x1="{rx}" y1="{ry}" x2="{rx + w}" y2="{ry + h}" '
-                f'stroke="#212529" stroke-width="2" stroke-linecap="round"/>'
+                f'stroke="{stroke}" stroke-width="{sw}" stroke-linecap="round"/>'
             )
         elif c["type"] == "image":
             src = a.get("src") or ""
