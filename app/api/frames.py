@@ -209,10 +209,12 @@ def render_frame_as_html(data: dict) -> str:
             fo = a.get("fillOpacity", 1)
             so = a.get("strokeOpacity", 1)
             opacity = "" if fo == 1 and so == 1 else f"; opacity: {min(fo, so)}"
+            sw = a.get("strokeWidth", 2)
+            rad = a.get("rx", 4)
             parts.append(
                 f'  <div style="position: absolute; left: {rx}px; top: {ry}px; '
                 f'width: {w}px; height: {h}px; background: {fill}; '
-                f'border: 2px solid {stroke}; border-radius: 4px; '
+                f'border: {sw}px solid {stroke}; border-radius: {rad}px; '
                 f'box-sizing: border-box{opacity}"></div>'
             )
         elif c["type"] == "text":
@@ -275,9 +277,11 @@ def render_frame_as_svg(data: dict) -> str:
             so = (
                 f' stroke-opacity="{a["strokeOpacity"]}"' if "strokeOpacity" in a else ""
             )
+            sw = a.get("strokeWidth", 2)
+            rad = a.get("rx", 4)
             out.append(
                 f'<rect x="{rx}" y="{ry}" width="{w}" height="{h}" '
-                f'fill="{fill}" stroke="{stroke}" stroke-width="2" rx="4"{fo}{so}/>'
+                f'fill="{fill}" stroke="{stroke}" stroke-width="{sw}" rx="{rad}"{fo}{so}/>'
             )
         elif c["type"] == "text":
             font_size = a.get("fontSize") or 14
