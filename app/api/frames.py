@@ -238,11 +238,22 @@ def render_frame_as_html(data: dict) -> str:
                 f'  <div style="{"; ".join(styles)}">{html_escape(a.get("text") or "")}</div>'
             )
         elif c["type"] == "note":
+            fill = a["fill"] if "fill" in a else "#fff8c6"
+            if fill is None:
+                fill = "transparent"
+            stroke = a["stroke"] if "stroke" in a else "#f1c40f"
+            if stroke is None:
+                stroke = "transparent"
+            sw = a.get("strokeWidth", 1)
+            rad = a.get("rx", 2)
+            color = a.get("color") or "#212529"
+            font_size = a.get("fontSize") or 13
             parts.append(
                 f'  <div style="position: absolute; left: {rx}px; top: {ry}px; '
-                f'width: {w}px; height: {h}px; background: #fff8c6; '
-                f'border: 1px solid #f1c40f; border-radius: 2px; padding: 8px; '
-                f'box-sizing: border-box; font-size: 13px; line-height: 1.4; '
+                f'width: {w}px; height: {h}px; background: {fill}; '
+                f'border: {sw}px solid {stroke}; border-radius: {rad}px; padding: 8px; '
+                f'box-sizing: border-box; font-size: {font_size}px; color: {color}; '
+                f'line-height: 1.4; '
                 f'white-space: pre-wrap; font-family: inherit;">'
                 f'{html_escape(a.get("text") or "")}</div>'
             )
@@ -298,18 +309,27 @@ def render_frame_as_svg(data: dict) -> str:
                 f'{html_escape(a.get("text") or "")}</text>'
             )
         elif c["type"] == "note":
+            fill = a["fill"] if "fill" in a else "#fff8c6"
+            if fill is None:
+                fill = "none"
+            stroke = a["stroke"] if "stroke" in a else "#f1c40f"
+            if stroke is None:
+                stroke = "none"
+            sw = a.get("strokeWidth", 1)
+            rad = a.get("rx", 2)
+            color = a.get("color") or "#212529"
+            font_size = a.get("fontSize") or 13
             out.append(
                 f'<rect x="{rx}" y="{ry}" width="{w}" height="{h}" '
-                f'fill="#fff8c6" stroke="#f1c40f" stroke-width="1" rx="2"/>'
+                f'fill="{fill}" stroke="{stroke}" stroke-width="{sw}" rx="{rad}"/>'
             )
-            font_size = 13
             padding = 8
             line_h = font_size * 1.4
             for i, line in enumerate((a.get("text") or "").split("\n")):
                 y = ry + padding + font_size + i * line_h
                 out.append(
                     f'<text x="{rx + padding}" y="{y}" font-size="{font_size}" '
-                    f'fill="#212529" font-family="system-ui, sans-serif">'
+                    f'fill="{color}" font-family="system-ui, sans-serif">'
                     f'{html_escape(line)}</text>'
                 )
         elif c["type"] == "line":
