@@ -1,4 +1,6 @@
 import math
+import urllib.parse
+import urllib.request
 from html import escape as html_escape
 from uuid import UUID
 
@@ -12,6 +14,28 @@ from app.core.deps import verify_token
 from app.core.exceptions import APIError
 from app.models.models import Board, BoardElement
 from app.schemas.common import CamelModel
+
+
+def _safe_image_fetcher(url: str, resource_type: str = "") -> bytes:
+    # Allow only https:// to external hosts (SSRF guard for the public PNG endpoint).
+    if not url.startswith("https://"):
+        raise ValueError(f"only https:// allowed, got: {url[:40]}")
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    blocked_prefixes = ("10.", "192.168.", "169.254.", "127.")
+    blocked_exact = {"localhost", "0.0.0.0", "::1"}
+    if host in blocked_exact or host.startswith(blocked_prefixes):
+        raise ValueError(f"blocked host: {host}")
+    if host.startswith("172."):
+        # 172.16.0.0/12 — private. 172.0–15 / 32–255 — public.
+        try:
+            second = int(host.split(".")[1])
+            if 16 <= second <= 31:
+                raise ValueError(f"blocked host: {host}")
+        except (ValueError, IndexError):
+            pass
+    req = urllib.request.Request(url, headers={"User-Agent": "rf-board/1.0"})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return r.read()
 
 router = APIRouter(prefix="/frames", tags=["frames"])
 
@@ -121,11 +145,19 @@ async def get_frame_png(
     frame_id: UUID,
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    import cairosvg
+    import io
+
+    from cairosvg.surface import PNGSurface
 
     data = await _load_frame_data(db, frame_id)
     svg = render_frame_as_svg(data)
-    png_bytes = cairosvg.svg2png(bytestring=svg.encode("utf-8"))
+    buf = io.BytesIO()
+    PNGSurface.convert(
+        bytestring=svg.encode("utf-8"),
+        url_fetcher=_safe_image_fetcher,
+        write_to=buf,
+    )
+    png_bytes = buf.getvalue()
     return Response(
         content=png_bytes,
         media_type="image/png",
@@ -265,6 +297,16 @@ def render_frame_as_html(data: dict) -> str:
                 f'width: {length}px; height: 2px; background: #212529; '
                 f'transform-origin: 0 50%; transform: rotate({angle:.2f}deg);"></div>'
             )
+        elif c["type"] == "image":
+            src = a.get("src") or ""
+            fit = a.get("fit") or "cover"
+            object_fit = {"contain": "contain", "fill": "fill"}.get(fit, "cover")
+            parts.append(
+                f'  <img src="{html_escape(src)}" '
+                f'style="position: absolute; left: {rx}px; top: {ry}px; '
+                f'width: {w}px; height: {h}px; '
+                f'object-fit: {object_fit}; display: block;"/>'
+            )
     parts.append("</div>")
     return "\n".join(parts)
 
@@ -336,6 +378,14 @@ def render_frame_as_svg(data: dict) -> str:
             out.append(
                 f'<line x1="{rx}" y1="{ry}" x2="{rx + w}" y2="{ry + h}" '
                 f'stroke="#212529" stroke-width="2" stroke-linecap="round"/>'
+            )
+        elif c["type"] == "image":
+            src = a.get("src") or ""
+            fit = a.get("fit") or "cover"
+            par = {"contain": "xMidYMid meet", "fill": "none"}.get(fit, "xMidYMid slice")
+            out.append(
+                f'<image href="{html_escape(src)}" x="{rx}" y="{ry}" '
+                f'width="{w}" height="{h}" preserveAspectRatio="{par}"/>'
             )
     out.append("</svg>")
     return "".join(out)
