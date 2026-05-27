@@ -12,6 +12,7 @@ services:
       - VERSION=${VERSION:-0.1.0}
       - DATABASE_URL=${DATABASE_URL}
       - API_KEY=${API_KEY}
+      - MEDIA_GC_TOKEN=${MEDIA_GC_TOKEN:-}
       - LOG_LEVEL=${LOG_LEVEL:-info}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/info"]
