@@ -1,7 +1,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -109,6 +109,11 @@ async def delete_board(
     ts = now_ms()
     board.deleted_at = ts
     board.updated_at = ts
+    await db.execute(
+        update(BoardElement)
+        .where(BoardElement.board_id == board_id, BoardElement.deleted_at.is_(None))
+        .values(deleted_at=ts, updated_at=ts)
+    )
     await db.commit()
 
 
