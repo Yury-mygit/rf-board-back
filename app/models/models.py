@@ -39,6 +39,13 @@ class BoardElement(Base):
         Uuid(), ForeignKey("boards.id"), nullable=False, index=True
     )
     type: Mapped[str] = mapped_column(String(20), nullable=False)
+    # Стабильный internal-to-external identifier для auto_designer-flow.
+    # Уникален в пределах board (partial unique index, см. миграцию
+    # 20260530_external_ref_on_board_elements). Скрипты делают upsert
+    # по нему — внутренний `id` сохраняется между запусками.
+    external_ref: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(), nullable=True
+    )
     parent_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(), ForeignKey("board_elements.id"), nullable=True, index=True
     )

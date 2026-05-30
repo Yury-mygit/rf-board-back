@@ -14,6 +14,7 @@ from app.schemas.board import (
     BoardElementCreate,
     BoardElementPatch,
     BoardElementResponse,
+    BoardElementUpsertByRef,
     BoardFull,
     BoardPatch,
     BoardResponse,
@@ -207,6 +208,149 @@ async def delete_element(
     element = await db.get(BoardElement, element_id)
     if not element or element.board_id != board_id:
         raise APIError(404, "element_not_found", f"Element with id '{element_id}' does not exist")
+    ts = now_ms()
+    element.deleted_at = ts
+    element.updated_at = ts
+    await db.commit()
+
+
+# ── Upsert / lookup / delete по external_ref ──────────────────────────────────
+# Используется auto_designer (Python pkg + CLI) для повторяемого рисования
+# фреймов: каждый screen имеет стабильный `external_ref` (UUID), скрипт
+# делает upsert по нему, internal `id` сохраняется.
+# Карта: cards/board/feature/2026-05-30-board-external-ref-stable-id.md.
+
+
+@router.post(
+    "/{board_id}/elements/by-ref",
+    response_model=BoardElementResponse,
+)
+async def upsert_element_by_ref(
+    board_id: UUID,
+    body: BoardElementUpsertByRef,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(verify_token),
+) -> BoardElement:
+    board = await db.get(Board, board_id)
+    if not board or board.deleted_at is not None:
+        raise APIError(404, "board_not_found", f"Board with id '{board_id}' does not exist")
+
+    existing = (
+        await db.execute(
+            select(BoardElement).where(
+                BoardElement.board_id == board_id,
+                BoardElement.external_ref == body.external_ref,
+                BoardElement.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+
+    if existing is not None:
+        # UPDATE: id не меняем (PK + потенциальные FK). z_index сохраняем.
+        if body.parent_id is not None:
+            await _validate_parent(db, board_id, existing.id, body.parent_id)
+        existing.type = body.type
+        existing.parent_id = body.parent_id
+        existing.x = body.x
+        existing.y = body.y
+        existing.w = body.w
+        existing.h = body.h
+        existing.attrs = body.attrs
+        existing.updated_at = body.updated_at
+        await db.commit()
+        await db.refresh(existing)
+        return existing
+
+    # INSERT: новый элемент с переданным `id` и `external_ref`.
+    if await db.get(BoardElement, body.id):
+        raise APIError(
+            409,
+            "conflict",
+            f"Element with id '{body.id}' already exists (but with different external_ref)",
+        )
+    if body.parent_id is not None:
+        await _validate_parent(db, board_id, body.id, body.parent_id)
+    max_z = (
+        await db.execute(
+            select(func.max(BoardElement.z_index)).where(BoardElement.board_id == board_id)
+        )
+    ).scalar()
+    next_z = (max_z + 1) if max_z is not None else 0
+    element = BoardElement(
+        id=body.id,
+        board_id=board_id,
+        external_ref=body.external_ref,
+        type=body.type,
+        parent_id=body.parent_id,
+        z_index=next_z,
+        x=body.x,
+        y=body.y,
+        w=body.w,
+        h=body.h,
+        attrs=body.attrs,
+        created_at=body.created_at,
+        updated_at=body.updated_at,
+        deleted_at=None,
+    )
+    db.add(element)
+    await db.commit()
+    await db.refresh(element)
+    return element
+
+
+@router.get(
+    "/{board_id}/elements/by-ref/{external_ref}",
+    response_model=BoardElementResponse,
+)
+async def get_element_by_ref(
+    board_id: UUID,
+    external_ref: UUID,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(verify_token),
+) -> BoardElement:
+    element = (
+        await db.execute(
+            select(BoardElement).where(
+                BoardElement.board_id == board_id,
+                BoardElement.external_ref == external_ref,
+                BoardElement.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if element is None:
+        raise APIError(
+            404,
+            "element_not_found",
+            f"Element with external_ref '{external_ref}' does not exist in board '{board_id}'",
+        )
+    return element
+
+
+@router.delete(
+    "/{board_id}/elements/by-ref/{external_ref}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_element_by_ref(
+    board_id: UUID,
+    external_ref: UUID,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(verify_token),
+) -> None:
+    element = (
+        await db.execute(
+            select(BoardElement).where(
+                BoardElement.board_id == board_id,
+                BoardElement.external_ref == external_ref,
+                BoardElement.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if element is None:
+        raise APIError(
+            404,
+            "element_not_found",
+            f"Element with external_ref '{external_ref}' does not exist in board '{board_id}'",
+        )
     ts = now_ms()
     element.deleted_at = ts
     element.updated_at = ts
