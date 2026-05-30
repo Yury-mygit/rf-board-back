@@ -79,7 +79,7 @@ async def list_boards(
     q = select(Board)
     if not include_deleted:
         q = q.where(Board.deleted_at.is_(None))
-    q = q.order_by(Board.updated_at.desc())
+    q = q.order_by(Board.order_index.asc(), Board.updated_at.desc())
     result = await db.execute(q)
     return list(result.scalars().all())
 
@@ -124,6 +124,7 @@ async def get_board(
     return {
         "id": board.id,
         "title": board.title,
+        "order_index": board.order_index,
         "created_at": board.created_at,
         "updated_at": board.updated_at,
         "deleted_at": board.deleted_at,

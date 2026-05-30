@@ -25,6 +25,9 @@ class Board(Base):
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Порядок в списке досок (drag-drop reorder). См. карту
+    # cards/board/feature/2026-05-30-board-ui-drawer-and-palette.md.
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     elements: Mapped[list["BoardElement"]] = relationship(
         "BoardElement", back_populates="board"

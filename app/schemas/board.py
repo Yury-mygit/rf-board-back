@@ -12,12 +12,14 @@ class BoardCreate(CamelModel):
 
 class BoardPatch(CamelModel):
     title: str | None = None
+    order_index: int | None = None
     updated_at: int
 
 
 class BoardResponse(CamelModel):
     id: UUID
     title: str
+    order_index: int = 0
     created_at: int
     updated_at: int
     deleted_at: int | None
@@ -87,6 +89,7 @@ class BoardElementUpsertByRef(CamelModel):
 class BoardFull(CamelModel):
     id: UUID
     title: str
+    order_index: int = 0
     created_at: int
     updated_at: int
     deleted_at: int | None
