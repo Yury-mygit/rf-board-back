@@ -10,7 +10,7 @@ async def verify_token(authorization: str | None = Header(default=None)) -> None
         raise APIError(401, "unauthorized", "Missing Authorization header")
     if not authorization.startswith("Bearer "):
         raise APIError(401, "unauthorized", "Invalid authorization format")
-    if authorization[7:] != settings.api_key:
+    if authorization[7:] not in settings.all_api_keys:
         raise APIError(401, "unauthorized", "Invalid token")
 
 
