@@ -22,6 +22,36 @@ from app.schemas.board import (
 )
 
 
+async def _move_children(
+    db: AsyncSession, board_id: UUID, parent_id: UUID,
+    dx: float, dy: float, ts: int,
+) -> list[BoardElement]:
+    """Рекурсивно сдвигает всех потомков (frame и dx/dy) — см. карта
+    `cards/board/bug/2026-05-30-frame-move-no-cascade-to-children.md`.
+
+    Возвращает плоский список перемещённых элементов (для emit publish).
+    """
+    moved: list[BoardElement] = []
+    children = (
+        await db.execute(
+            select(BoardElement).where(
+                BoardElement.board_id == board_id,
+                BoardElement.parent_id == parent_id,
+                BoardElement.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    for c in children:
+        c.x = c.x + dx
+        c.y = c.y + dy
+        c.updated_at = ts
+        moved.append(c)
+        # рекурсия: если ребёнок — frame, его потомки тоже двигаются
+        if c.type == "frame":
+            moved.extend(await _move_children(db, board_id, c.id, dx, dy, ts))
+    return moved
+
+
 def _el_payload(el: BoardElement) -> dict:
     """Сериализация элемента для SSE payload (плоский dict)."""
     return {
@@ -221,12 +251,29 @@ async def patch_element(
         updated_at = data.pop("updated_at")
         if "parent_id" in data and data["parent_id"] is not None:
             await _validate_parent(db, board_id, element_id, data["parent_id"])
+        # cascade-move для frame: запоминаем старые координаты
+        old_x, old_y = element.x, element.y
         for key, value in data.items():
             setattr(element, key, value)
         element.updated_at = updated_at
+        cascade_dx = cascade_dy = 0.0
+        if element.type == "frame":
+            cascade_dx = element.x - old_x
+            cascade_dy = element.y - old_y
+            if cascade_dx or cascade_dy:
+                # БД-cascade: чтобы reload показывал согласованное состояние.
+                # Events для children НЕ публикуем — фронт сам translate'нет
+                # всех потомков локально (одна синхронная анимация).
+                await _move_children(
+                    db, board_id, element_id, cascade_dx, cascade_dy, updated_at,
+                )
         await db.commit()
         await db.refresh(element)
-        bp_publish(board_id, {"type": "element_patched", "element": _el_payload(element)})
+        payload = _el_payload(element)
+        if cascade_dx or cascade_dy:
+            payload["cascade_dx"] = cascade_dx
+            payload["cascade_dy"] = cascade_dy
+        bp_publish(board_id, {"type": "element_patched", "element": payload})
     return element
 
 
@@ -283,6 +330,8 @@ async def upsert_element_by_ref(
         # UPDATE: id не меняем (PK + потенциальные FK). z_index сохраняем.
         if body.parent_id is not None:
             await _validate_parent(db, board_id, existing.id, body.parent_id)
+        # cascade-move для frame: запоминаем старые координаты
+        old_x, old_y = existing.x, existing.y
         existing.type = body.type
         existing.parent_id = body.parent_id
         existing.x = body.x
@@ -291,9 +340,21 @@ async def upsert_element_by_ref(
         existing.h = body.h
         existing.attrs = body.attrs
         existing.updated_at = body.updated_at
+        cascade_dx = cascade_dy = 0.0
+        if existing.type == "frame":
+            cascade_dx = body.x - old_x
+            cascade_dy = body.y - old_y
+            if cascade_dx or cascade_dy:
+                await _move_children(
+                    db, board_id, existing.id, cascade_dx, cascade_dy, body.updated_at,
+                )
         await db.commit()
         await db.refresh(existing)
-        bp_publish(board_id, {"type": "element_upserted", "element": _el_payload(existing)})
+        payload = _el_payload(existing)
+        if cascade_dx or cascade_dy:
+            payload["cascade_dx"] = cascade_dx
+            payload["cascade_dy"] = cascade_dy
+        bp_publish(board_id, {"type": "element_upserted", "element": payload})
         return existing
 
     # INSERT: новый элемент с переданным `id` и `external_ref`.
