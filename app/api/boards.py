@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.board_pubsub import publish as bp_publish
 from app.core.database import get_db
 from app.core.deps import verify_token
 from app.core.exceptions import APIError
@@ -19,6 +20,22 @@ from app.schemas.board import (
     BoardPatch,
     BoardResponse,
 )
+
+
+def _el_payload(el: BoardElement) -> dict:
+    """Сериализация элемента для SSE payload (плоский dict)."""
+    return {
+        "id": str(el.id),
+        "board_id": str(el.board_id),
+        "type": el.type,
+        "external_ref": str(el.external_ref) if el.external_ref else None,
+        "parent_id": str(el.parent_id) if el.parent_id else None,
+        "z_index": el.z_index,
+        "x": el.x, "y": el.y, "w": el.w, "h": el.h,
+        "attrs": el.attrs or {},
+        "created_at": el.created_at, "updated_at": el.updated_at,
+        "deleted_at": el.deleted_at,
+    }
 
 router = APIRouter(prefix="/boards", tags=["boards"])
 
@@ -49,6 +66,13 @@ async def create_board(
     db.add(board)
     await db.commit()
     await db.refresh(board)
+    bp_publish(board.id, {
+        "type": "board_created",
+        "board": {
+            "id": str(board.id), "title": board.title,
+            "created_at": board.created_at, "updated_at": board.updated_at,
+        },
+    })
     return board
 
 
@@ -95,6 +119,13 @@ async def patch_board(
         board.updated_at = updated_at
         await db.commit()
         await db.refresh(board)
+        bp_publish(board.id, {
+            "type": "board_patched",
+            "board": {
+                "id": str(board.id), "title": board.title,
+                "created_at": board.created_at, "updated_at": board.updated_at,
+            },
+        })
     return board
 
 
@@ -116,6 +147,7 @@ async def delete_board(
         .values(deleted_at=ts, updated_at=ts)
     )
     await db.commit()
+    bp_publish(board_id, {"type": "board_deleted", "board_id": str(board_id), "ts": ts})
 
 
 # ── Elements ──────────────────────────────────────────────────────────────────
@@ -169,6 +201,7 @@ async def create_element(
     db.add(element)
     await db.commit()
     await db.refresh(element)
+    bp_publish(board_id, {"type": "element_upserted", "element": _el_payload(element)})
     return element
 
 
@@ -193,6 +226,7 @@ async def patch_element(
         element.updated_at = updated_at
         await db.commit()
         await db.refresh(element)
+        bp_publish(board_id, {"type": "element_patched", "element": _el_payload(element)})
     return element
 
 
@@ -259,6 +293,7 @@ async def upsert_element_by_ref(
         existing.updated_at = body.updated_at
         await db.commit()
         await db.refresh(existing)
+        bp_publish(board_id, {"type": "element_upserted", "element": _el_payload(existing)})
         return existing
 
     # INSERT: новый элемент с переданным `id` и `external_ref`.
@@ -295,6 +330,7 @@ async def upsert_element_by_ref(
     db.add(element)
     await db.commit()
     await db.refresh(element)
+    bp_publish(board_id, {"type": "element_upserted", "element": _el_payload(element)})
     return element
 
 
@@ -355,6 +391,12 @@ async def delete_element_by_ref(
     element.deleted_at = ts
     element.updated_at = ts
     await db.commit()
+    bp_publish(board_id, {
+        "type": "element_deleted",
+        "element_id": str(element.id),
+        "external_ref": str(external_ref),
+        "ts": ts,
+    })
 
 
 @router.post(
@@ -382,4 +424,5 @@ async def restore_element(
     element.updated_at = ts
     await db.commit()
     await db.refresh(element)
+    bp_publish(board_id, {"type": "element_upserted", "element": _el_payload(element)})
     return element
