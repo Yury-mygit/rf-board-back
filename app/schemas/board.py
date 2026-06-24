@@ -72,6 +72,15 @@ class BoardElementUpsertByRef(CamelModel):
     Если элемент с такой парой (board_id, external_ref) уже есть —
     обновляем его поля (id игнорируется, чтобы не ломать FK). Если
     нет — создаём с переданным `id`.
+
+    `attrs` — JSONB free-form. Notable type-specific keys (см. также
+    frontend `board.js` и `frames.py`):
+    - text: `text, fontSize, color, bold, italic, underline,
+      wrap`. `wrap=true` → wrap-mode: явная `w/h`, word-wrap по
+      ширине (HTML + SVG/PNG). Default = single-line label.
+    - rect: `fill, stroke, strokeWidth, rx, fillOpacity, strokeOpacity`.
+    - note: `text, fontSize, color, fill, stroke, strokeWidth, rx,
+      autoFit`.
     """
     external_ref: UUID
     id: UUID

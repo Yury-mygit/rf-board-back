@@ -224,6 +224,35 @@ def _svg_stroke_color(a: dict) -> str:
     return "#212529"
 
 
+# Card #134: greedy word-wrap для text wrap-mode в SVG/PNG.
+# Точную ширину символа system-ui посчитать без шрифт-файла нельзя;
+# берём грубое приближение 0.55 * fontSize — достаточно для макетов
+# (~95% точности на кириллице/латинице, длинные слова не дробятся).
+def wrap_text(text: str, width: float, font_size: float) -> list[str]:
+    if not text:
+        return [""]
+    char_w = font_size * 0.55
+    max_chars = max(1, int(width / char_w))
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        if not paragraph:
+            lines.append("")
+            continue
+        words = paragraph.split(" ")
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = word  # длинное слово — пускаем как есть (soft overflow)
+        if current:
+            lines.append(current)
+    return lines
+
+
 def render_frame_as_html(data: dict) -> str:
     f = data["frame"]
     title = f.get("title") or ""
@@ -266,6 +295,12 @@ def render_frame_as_html(data: dict) -> str:
                 styles.append("font-style: italic")
             if a.get("underline"):
                 styles.append("text-decoration: underline")
+            # wrap-mode (card #134): явная ширина + word-wrap по w
+            if a.get("wrap"):
+                styles.append(f"width: {w}px")
+                styles.append("white-space: pre-wrap")
+                styles.append("word-wrap: break-word")
+                styles.append("line-height: 1.4")
             parts.append(
                 f'  <div style="{"; ".join(styles)}">{html_escape(a.get("text") or "")}</div>'
             )
@@ -343,17 +378,31 @@ def render_frame_as_svg(data: dict) -> str:
         elif c["type"] == "text":
             font_size = a.get("fontSize") or 14
             color = a.get("color") or "#212529"
-            y = ry + font_size
             weight = "bold" if a.get("bold") else "normal"
             style = "italic" if a.get("italic") else "normal"
             deco = "underline" if a.get("underline") else "none"
-            out.append(
-                f'<text x="{rx}" y="{y}" font-size="{font_size}" fill="{color}" '
+            common = (
+                f'font-size="{font_size}" fill="{color}" '
                 f'font-weight="{weight}" font-style="{style}" '
                 f'text-decoration="{deco}" '
-                f'font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif">'
-                f'{html_escape(a.get("text") or "")}</text>'
+                f'font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif"'
             )
+            raw = a.get("text") or ""
+            if a.get("wrap") and w > 0:
+                # Card #134: greedy word-wrap по w, line-height = fontSize*1.4
+                line_h = font_size * 1.4
+                for i, line in enumerate(wrap_text(raw, w, font_size)):
+                    ly = ry + font_size + i * line_h
+                    out.append(
+                        f'<text x="{rx}" y="{ly}" {common}>'
+                        f'{html_escape(line)}</text>'
+                    )
+            else:
+                y = ry + font_size
+                out.append(
+                    f'<text x="{rx}" y="{y}" {common}>'
+                    f'{html_escape(raw)}</text>'
+                )
         elif c["type"] == "note":
             fill = a["fill"] if "fill" in a else "#fff8c6"
             if fill is None:
