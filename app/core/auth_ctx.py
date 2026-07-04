@@ -227,12 +227,16 @@ async def your_capabilities_map(
     """
     if not boards:
         return {}
-    all_true = BoardCaps(
-        is_owner=False, is_curator=True,
-        can_read=True, can_write=True, can_share=True,
-    )
     if ctx.is_curator:
-        return {b.id: all_true for b in boards}
+        # Curator: все capability, plus is_owner=True если реально владелец.
+        return {
+            b.id: BoardCaps(
+                is_owner=(b.owner_uuid == ctx.user_uuid),
+                is_curator=True,
+                can_read=True, can_write=True, can_share=True,
+            )
+            for b in boards
+        }
 
     owner_caps = BoardCaps(
         is_owner=True, is_curator=False,
