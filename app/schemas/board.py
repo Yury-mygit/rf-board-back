@@ -23,6 +23,10 @@ class BoardResponse(CamelModel):
     created_at: int
     updated_at: int
     deleted_at: int | None
+    # Карта #130: владелец (NULL = orphan, видим только curator'у).
+    owner_uuid: UUID | None = None
+    # Stage 7c: роль текущего юзера — owner | write | read | curator.
+    your_role: str | None = None
 
 
 class BoardElementCreate(CamelModel):
@@ -102,4 +106,6 @@ class BoardFull(CamelModel):
     created_at: int
     updated_at: int
     deleted_at: int | None
+    owner_uuid: UUID | None = None
+    your_role: str | None = None
     elements: list[BoardElementResponse]

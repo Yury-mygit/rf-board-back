@@ -2,10 +2,15 @@
 
 Endpoint: `GET /api/v1/boards/{board_id}/events`.
 
-Auth: либо Bearer-token (для CLI/scripts/MCP), либо forward_auth от
-Caddy через `auth_session` cookie (для user UI). Bearer проверяется
-здесь (settings.all_api_keys); cookie — на уровне Caddy `auth_required
-board-dev`, backend ничего не проверяет (доверяет X-User-Email).
+Auth: forward_auth от Caddy (`auth_required board-dev`) инжектит
+X-User-Uuid/Email/Is-Curator. `current_user` 401-ит без них —
+defence-in-depth против прямых server-to-server вызовов в обход
+Caddy. ACL: `require_board(id, 200)` (карта 2026-06-23-board-
+ownership-and-grants Stage 3.7).
+
+EventSource не может выставить Authorization header, поэтому
+Bearer-shared-key здесь не проверяется — auth опирается на cookie
+через forward_auth.
 
 Heartbeat 30с, retry 5с. Caddy `board.dev` блок выставляет
 `flush_interval -1` для path `/api/v1/boards/*/events`.
@@ -16,11 +21,13 @@ import asyncio
 import json
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Query, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_ctx import AuthCtx, current_user, require_board
 from app.core.board_pubsub import subscribe
-from app.core.config import settings
+from app.core.database import get_db
 
 
 router = APIRouter(prefix="/boards", tags=["events"])
@@ -28,28 +35,14 @@ router = APIRouter(prefix="/boards", tags=["events"])
 _HEARTBEAT_SECONDS = 30
 
 
-def _has_valid_bearer(authorization: str | None, token: str | None) -> bool:
-    raw = None
-    if authorization and authorization.startswith("Bearer "):
-        raw = authorization[7:]
-    elif token:
-        raw = token
-    return bool(raw) and raw in settings.all_api_keys
-
-
 @router.get("/{board_id}/events")
 async def board_events(
     request: Request,
     board_id: UUID,
-    authorization: str | None = Header(default=None),
-    token: str | None = Query(default=None),
-    x_user_email: str | None = Header(default=None, alias="X-User-Email"),
+    db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
 ) -> StreamingResponse:
-    # Авторизация: либо Bearer (для CLI), либо forward_auth-cookie
-    # (X-User-Email injected by Caddy auth_required board-dev).
-    if not _has_valid_bearer(authorization, token) and not x_user_email:
-        from app.core.exceptions import APIError
-        raise APIError(401, "unauthorized", "Missing auth (Bearer or session cookie)")
+    await require_board(db, ctx, board_id, 200)
 
     async def gen():
         yield "retry: 5000\n\n"

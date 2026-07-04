@@ -3,9 +3,11 @@ import uuid
 from sqlalchemy import (
     JSON,
     BigInteger,
+    CheckConstraint,
     Float,
     ForeignKey,
     Integer,
+    PrimaryKeyConstraint,
     String,
     Text,
     Uuid,
@@ -28,9 +30,17 @@ class Board(Base):
     # Порядок в списке досок (drag-drop reorder). См. карту
     # cards/board/feature/2026-05-30-board-ui-drawer-and-palette.md.
     order_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Владелец доски. NULL = orphan (доски, созданные до миграции
+    # board_ownership_and_grants). См. карту 2026-06-23-board-ownership-and-grants.md.
+    owner_uuid: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(), nullable=True, index=True
+    )
 
     elements: Mapped[list["BoardElement"]] = relationship(
         "BoardElement", back_populates="board"
+    )
+    grants: Mapped[list["BoardGrant"]] = relationship(
+        "BoardGrant", back_populates="board", cascade="all, delete-orphan"
     )
 
 
@@ -63,3 +73,53 @@ class BoardElement(Base):
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     board: Mapped["Board"] = relationship("Board", back_populates="elements")
+
+
+class BoardGrant(Base):
+    """Шаринг доски по attribute-каналу с lazy-bind до UUID.
+
+    D4 (карта #130, переписана 2026-06-27 после #137): grant хранит
+    канал-attribute (`email|telegram|handle`) + значение; `subject_uuid`
+    резолвится при первом hit'е от юзера, у которого один из его
+    X-User-* header'ов совпал с (attr_kind, attr_value). Никаких
+    лукапов в auth → no existence leak.
+
+    Один и тот же владелец может пошарить с одним и тем же UUID по
+    разным каналам (например, и по email, и по telegram) — это
+    разрешено, две grant-строки, обе резолвятся к одному UUID.
+    """
+    __tablename__ = "board_grants"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "board_id",
+            "subject_attr_kind",
+            "subject_attr_value",
+            name="pk_board_grants",
+        ),
+        CheckConstraint("level IN (200, 300)", name="ck_board_grants_level"),
+        CheckConstraint(
+            "subject_attr_kind IN ('email', 'telegram', 'handle')",
+            name="ck_board_grants_attr_kind",
+        ),
+    )
+
+    board_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(),
+        ForeignKey("boards.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Канал шаринга. Совпадает с одним из X-User-{Email,Telegram,Handle}.
+    subject_attr_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Значение attribute. Lowercased для email и handle; str(tg_id) для
+    # telegram. На стороне POST endpoint санитизируется до записи.
+    subject_attr_value: Mapped[str] = mapped_column(Text, nullable=False)
+    # Резолвится при первом hit'е от юзера с этим (kind, value) (lazy bind).
+    subject_uuid: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(), nullable=True, index=True
+    )
+    # 200=read, 300=write (симметрия с auth, D3).
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    granted_by_uuid: Mapped[uuid.UUID] = mapped_column(Uuid(), nullable=False)
+    granted_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    board: Mapped["Board"] = relationship("Board", back_populates="grants")

@@ -4,6 +4,13 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_ctx import (
+    AuthCtx,
+    current_user,
+    require_board,
+    visible_boards_query,
+    your_role_map,
+)
 from app.core.board_pubsub import publish as bp_publish
 from app.core.database import get_db
 from app.core.deps import verify_token
@@ -70,29 +77,46 @@ def _el_payload(el: BoardElement) -> dict:
 router = APIRouter(prefix="/boards", tags=["boards"])
 
 
+def _board_dict(b: Board, your_role: str | None) -> dict:
+    """Карта #130 Stage 7c: единый сериализатор Board → dict с your_role."""
+    return {
+        "id": b.id,
+        "title": b.title,
+        "order_index": b.order_index,
+        "owner_uuid": b.owner_uuid,
+        "your_role": your_role,
+        "created_at": b.created_at,
+        "updated_at": b.updated_at,
+        "deleted_at": b.deleted_at,
+    }
+
+
 @router.get("", response_model=list[BoardResponse])
 async def list_boards(
     include_deleted: bool = Query(default=False, alias="includeDeleted"),
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
-) -> list[Board]:
-    q = select(Board)
+) -> list[dict]:
+    q = visible_boards_query(ctx)
     if not include_deleted:
         q = q.where(Board.deleted_at.is_(None))
     q = q.order_by(Board.order_index.asc(), Board.updated_at.desc())
-    result = await db.execute(q)
-    return list(result.scalars().all())
+    boards = list((await db.execute(q)).scalars().all())
+    roles = await your_role_map(db, ctx, boards)
+    return [_board_dict(b, roles.get(b.id)) for b in boards]
 
 
 @router.post("", response_model=BoardResponse, status_code=status.HTTP_201_CREATED)
 async def create_board(
     body: BoardCreate,
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
-) -> Board:
+) -> dict:
     if await db.get(Board, body.id):
         raise APIError(409, "conflict", f"Board with id '{body.id}' already exists")
-    board = Board(**body.model_dump(), deleted_at=None)
+    board = Board(**body.model_dump(), deleted_at=None, owner_uuid=ctx.user_uuid)
     db.add(board)
     await db.commit()
     await db.refresh(board)
@@ -103,31 +127,28 @@ async def create_board(
             "created_at": board.created_at, "updated_at": board.updated_at,
         },
     })
-    return board
+    # Создатель → owner (или curator, если так).
+    your_role = "curator" if ctx.is_curator else "owner"
+    return _board_dict(board, your_role)
 
 
 @router.get("/{board_id}", response_model=BoardFull)
 async def get_board(
     board_id: UUID,
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> dict:
-    board = await db.get(Board, board_id)
-    if not board or board.deleted_at is not None:
-        raise APIError(404, "board_not_found", f"Board with id '{board_id}' does not exist")
+    board = await require_board(db, ctx, board_id, 200)
     q = (
         select(BoardElement)
         .where(BoardElement.board_id == board_id, BoardElement.deleted_at.is_(None))
         .order_by(BoardElement.z_index.asc())
     )
     elements = (await db.execute(q)).scalars().all()
+    roles = await your_role_map(db, ctx, [board])
     return {
-        "id": board.id,
-        "title": board.title,
-        "order_index": board.order_index,
-        "created_at": board.created_at,
-        "updated_at": board.updated_at,
-        "deleted_at": board.deleted_at,
+        **_board_dict(board, roles.get(board.id)),
         "elements": list(elements),
     }
 
@@ -137,11 +158,10 @@ async def patch_board(
     board_id: UUID,
     body: BoardPatch,
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
-) -> Board:
-    board = await db.get(Board, board_id)
-    if not board or board.deleted_at is not None:
-        raise APIError(404, "board_not_found", f"Board with id '{board_id}' does not exist")
+) -> dict:
+    board = await require_board(db, ctx, board_id, 300)
     if body.updated_at >= board.updated_at:
         data = body.model_dump(exclude_unset=True)
         updated_at = data.pop("updated_at")
@@ -157,18 +177,22 @@ async def patch_board(
                 "created_at": board.created_at, "updated_at": board.updated_at,
             },
         })
-    return board
+    roles = await your_role_map(db, ctx, [board])
+    return _board_dict(board, roles.get(board.id))
 
 
 @router.delete("/{board_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_board(
     board_id: UUID,
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> None:
     board = await db.get(Board, board_id)
     if not board:
         raise APIError(404, "board_not_found", f"Board with id '{board_id}' does not exist")
+    if not ctx.is_curator and board.owner_uuid != ctx.user_uuid:
+        raise APIError(403, "forbidden", "Only board owner or curator can delete")
     ts = now_ms()
     board.deleted_at = ts
     board.updated_at = ts
@@ -208,11 +232,10 @@ async def create_element(
     board_id: UUID,
     body: BoardElementCreate,
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> BoardElement:
-    board = await db.get(Board, board_id)
-    if not board or board.deleted_at is not None:
-        raise APIError(404, "board_not_found", f"Board with id '{board_id}' does not exist")
+    await require_board(db, ctx, board_id, 300)
     if await db.get(BoardElement, body.id):
         raise APIError(409, "conflict", f"Element with id '{body.id}' already exists")
     if body.parent_id is not None:
@@ -242,8 +265,10 @@ async def patch_element(
     element_id: UUID,
     body: BoardElementPatch,
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> BoardElement:
+    await require_board(db, ctx, board_id, 300)
     element = await db.get(BoardElement, element_id)
     if not element or element.deleted_at is not None or element.board_id != board_id:
         raise APIError(404, "element_not_found", f"Element with id '{element_id}' does not exist")
@@ -285,8 +310,10 @@ async def delete_element(
     board_id: UUID,
     element_id: UUID,
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> None:
+    await require_board(db, ctx, board_id, 300)
     element = await db.get(BoardElement, element_id)
     if not element or element.board_id != board_id:
         raise APIError(404, "element_not_found", f"Element with id '{element_id}' does not exist")
@@ -311,11 +338,10 @@ async def upsert_element_by_ref(
     board_id: UUID,
     body: BoardElementUpsertByRef,
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> BoardElement:
-    board = await db.get(Board, board_id)
-    if not board or board.deleted_at is not None:
-        raise APIError(404, "board_not_found", f"Board with id '{board_id}' does not exist")
+    await require_board(db, ctx, board_id, 300)
 
     existing = (
         await db.execute(
@@ -404,8 +430,10 @@ async def get_element_by_ref(
     board_id: UUID,
     external_ref: UUID,
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> BoardElement:
+    await require_board(db, ctx, board_id, 200)
     element = (
         await db.execute(
             select(BoardElement).where(
@@ -432,8 +460,10 @@ async def delete_element_by_ref(
     board_id: UUID,
     external_ref: UUID,
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> None:
+    await require_board(db, ctx, board_id, 300)
     element = (
         await db.execute(
             select(BoardElement).where(
@@ -469,11 +499,10 @@ async def restore_element(
     board_id: UUID,
     element_id: UUID,
     db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> BoardElement:
-    board = await db.get(Board, board_id)
-    if not board or board.deleted_at is not None:
-        raise APIError(404, "board_not_found", f"Board with id '{board_id}' does not exist")
+    await require_board(db, ctx, board_id, 300)
     element = await db.get(BoardElement, element_id)
     if not element or element.board_id != board_id:
         raise APIError(404, "element_not_found", f"Element with id '{element_id}' does not exist")
