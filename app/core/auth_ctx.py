@@ -16,6 +16,7 @@ Caddy snippet `auth_required board-dev` инжектит:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 from uuid import UUID
 
 from fastapi import Header
@@ -24,6 +25,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import APIError
 from app.models.models import Board, BoardGrant
+
+
+Capability = Literal["read", "write", "share"]
+_CAP_COLUMN = {
+    "read": BoardGrant.can_read,
+    "write": BoardGrant.can_write,
+    "share": BoardGrant.can_share,
+}
 
 
 @dataclass(frozen=True)
@@ -123,10 +132,13 @@ async def require_board(
     db: AsyncSession,
     ctx: AuthCtx,
     board_id: UUID,
-    min_level: int,
+    capability: Capability,
     include_deleted: bool = False,
 ) -> Board:
-    """ACL-gate: curator → ok; owner → ok; grant.level >= min_level → ok.
+    """ACL-gate: curator → ok; owner → ok; grant с нужной capability → ok.
+
+    BRD-3: capability ∈ {read, write, share}. Проверяется bool-колонка
+    grant'а напрямую (не ordinal level).
 
     Matching grant:
     - subject_uuid == ctx.user_uuid (резолвленный grant), ИЛИ
@@ -152,8 +164,6 @@ async def require_board(
 
     attr_match = _attr_match_clause(ctx)
     if attr_match is None:
-        # Юзер без attributes — pending grants ему не светят. Resolve
-        # только по subject_uuid (грантов, привязанных к нему ранее).
         grant_predicate = BoardGrant.subject_uuid == ctx.user_uuid
     else:
         grant_predicate = or_(
@@ -161,20 +171,22 @@ async def require_board(
             and_(BoardGrant.subject_uuid.is_(None), attr_match),
         )
 
+    cap_col = _CAP_COLUMN[capability]
     grant = (
         await db.execute(
             select(BoardGrant).where(
                 BoardGrant.board_id == board_id,
                 grant_predicate,
+                cap_col.is_(True),
             )
         )
     ).scalar_one_or_none()
 
-    if grant is None or grant.level < min_level:
+    if grant is None:
         raise APIError(
             403,
             "forbidden",
-            f"No access to board '{board_id}' at level {min_level}",
+            f"No access to board '{board_id}' with capability {capability!r}",
         )
 
     if grant.subject_uuid is None:
@@ -194,19 +206,38 @@ async def require_board(
     return board
 
 
-async def your_role_map(
-    db: AsyncSession, ctx: AuthCtx, boards: list[Board]
-) -> dict[UUID, str]:
-    """Возвращает {board_id: role} для UI (Stage 7c). Значения:
-    `curator` | `owner` | `write` | `read`.
+@dataclass(frozen=True)
+class BoardCaps:
+    """Пять булевых для UI (BRD-3 D5). Заменяет legacy строку `yourRole`."""
+    is_owner: bool = False
+    is_curator: bool = False
+    can_read: bool = False
+    can_write: bool = False
+    can_share: bool = False
 
-    Один батч-запрос за max grant level для не-owner досок. Curator всегда
-    'curator' (bypass всех проверок).
+
+async def your_capabilities_map(
+    db: AsyncSession, ctx: AuthCtx, boards: list[Board]
+) -> dict[UUID, BoardCaps]:
+    """Возвращает {board_id: BoardCaps} для UI. Один батч-запрос
+    за max(bool) по каждой capability для не-owner досок.
+
+    Curator — все флаги True (bypass ACL). Owner — is_owner True,
+    все capability True (owner может всё).
     """
     if not boards:
         return {}
+    all_true = BoardCaps(
+        is_owner=False, is_curator=True,
+        can_read=True, can_write=True, can_share=True,
+    )
     if ctx.is_curator:
-        return {b.id: "curator" for b in boards}
+        return {b.id: all_true for b in boards}
+
+    owner_caps = BoardCaps(
+        is_owner=True, is_curator=False,
+        can_read=True, can_write=True, can_share=True,
+    )
 
     owner_ids: set[UUID] = set()
     non_owner_ids: list[UUID] = []
@@ -216,7 +247,7 @@ async def your_role_map(
         else:
             non_owner_ids.append(b.id)
 
-    grant_levels: dict[UUID, int] = {}
+    grant_caps: dict[UUID, tuple[bool, bool, bool]] = {}
     if non_owner_ids:
         attr_match = _attr_match_clause(ctx)
         if attr_match is None:
@@ -228,27 +259,37 @@ async def your_role_map(
             )
         rows = (
             await db.execute(
-                select(BoardGrant.board_id, func.max(BoardGrant.level))
+                select(
+                    BoardGrant.board_id,
+                    func.bool_or(BoardGrant.can_read),
+                    func.bool_or(BoardGrant.can_write),
+                    func.bool_or(BoardGrant.can_share),
+                )
                 .where(BoardGrant.board_id.in_(non_owner_ids), grant_filter)
                 .group_by(BoardGrant.board_id)
             )
         ).all()
-        grant_levels = {bid: lvl for bid, lvl in rows}
+        grant_caps = {bid: (r, w, s) for bid, r, w, s in rows}
 
-    out: dict[UUID, str] = {}
+    out: dict[UUID, BoardCaps] = {}
     for b in boards:
         if b.id in owner_ids:
-            out[b.id] = "owner"
+            out[b.id] = owner_caps
         else:
-            lvl = grant_levels.get(b.id)
-            out[b.id] = "write" if lvl == 300 else "read"
+            r, w, s = grant_caps.get(b.id, (False, False, False))
+            out[b.id] = BoardCaps(
+                is_owner=False, is_curator=False,
+                can_read=r, can_write=w, can_share=s,
+            )
     return out
 
 
 __all__ = [
     "AuthCtx",
+    "BoardCaps",
+    "Capability",
     "current_user",
     "visible_boards_query",
     "require_board",
-    "your_role_map",
+    "your_capabilities_map",
 ]

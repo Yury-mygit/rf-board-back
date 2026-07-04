@@ -3,6 +3,7 @@ import uuid
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     CheckConstraint,
     Float,
     ForeignKey,
@@ -78,15 +79,14 @@ class BoardElement(Base):
 class BoardGrant(Base):
     """Шаринг доски по attribute-каналу с lazy-bind до UUID.
 
-    D4 (карта #130, переписана 2026-06-27 после #137): grant хранит
-    канал-attribute (`email|telegram|handle`) + значение; `subject_uuid`
-    резолвится при первом hit'е от юзера, у которого один из его
-    X-User-* header'ов совпал с (attr_kind, attr_value). Никаких
-    лукапов в auth → no existence leak.
+    BRD-3: ordinal level 200/300 заменён на три независимых булевых
+    capability `can_read/can_write/can_share`. Инварианты (CHECK):
+    write→read, share→read, at-least-one.
 
-    Один и тот же владелец может пошарить с одним и тем же UUID по
-    разным каналам (например, и по email, и по telegram) — это
-    разрешено, две grant-строки, обе резолвятся к одному UUID.
+    D4 (BRD-1): grant хранит канал-attribute (email|telegram|handle) +
+    значение; `subject_uuid` резолвится при первом hit'е от юзера, у
+    которого один из его X-User-* header'ов совпал с (attr_kind,
+    attr_value). Никаких лукапов в auth → no existence leak.
     """
     __tablename__ = "board_grants"
     __table_args__ = (
@@ -96,10 +96,21 @@ class BoardGrant(Base):
             "subject_attr_value",
             name="pk_board_grants",
         ),
-        CheckConstraint("level IN (200, 300)", name="ck_board_grants_level"),
         CheckConstraint(
             "subject_attr_kind IN ('email', 'telegram', 'handle')",
             name="ck_board_grants_attr_kind",
+        ),
+        CheckConstraint(
+            "NOT can_write OR can_read",
+            name="ck_board_grants_write_implies_read",
+        ),
+        CheckConstraint(
+            "NOT can_share OR can_read",
+            name="ck_board_grants_share_implies_read",
+        ),
+        CheckConstraint(
+            "can_read OR can_write OR can_share",
+            name="ck_board_grants_at_least_one",
         ),
     )
 
@@ -117,8 +128,10 @@ class BoardGrant(Base):
     subject_uuid: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(), nullable=True, index=True
     )
-    # 200=read, 300=write (симметрия с auth, D3).
-    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Capability-model (BRD-3). Инварианты в CheckConstraint выше.
+    can_read: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    can_write: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    can_share: Mapped[bool] = mapped_column(Boolean, nullable=False)
     granted_by_uuid: Mapped[uuid.UUID] = mapped_column(Uuid(), nullable=False)
     granted_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 

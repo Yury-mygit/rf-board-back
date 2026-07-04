@@ -5,7 +5,7 @@ Endpoint: `GET /api/v1/boards/{board_id}/events`.
 Auth: forward_auth от Caddy (`auth_required board-dev`) инжектит
 X-User-Uuid/Email/Is-Curator. `current_user` 401-ит без них —
 defence-in-depth против прямых server-to-server вызовов в обход
-Caddy. ACL: `require_board(id, 200)` (карта 2026-06-23-board-
+Caddy. ACL: `require_board(id, "read")` (карта 2026-06-23-board-
 ownership-and-grants Stage 3.7).
 
 EventSource не может выставить Authorization header, поэтому
@@ -42,7 +42,7 @@ async def board_events(
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
 ) -> StreamingResponse:
-    await require_board(db, ctx, board_id, 200)
+    await require_board(db, ctx, board_id, "read")
 
     async def gen():
         yield "retry: 5000\n\n"

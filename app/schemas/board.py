@@ -23,10 +23,15 @@ class BoardResponse(CamelModel):
     created_at: int
     updated_at: int
     deleted_at: int | None
-    # Карта #130: владелец (NULL = orphan, видим только curator'у).
+    # BRD-1: владелец (NULL = orphan, видим только curator'у).
     owner_uuid: UUID | None = None
-    # Stage 7c: роль текущего юзера — owner | write | read | curator.
-    your_role: str | None = None
+    # BRD-3 D5: capability-флаги текущего юзера. Legacy `yourRole` строка
+    # (owner|curator|write|read) удалена — клиент читает bool-ы напрямую.
+    is_owner: bool = False
+    is_curator: bool = False
+    can_read: bool = False
+    can_write: bool = False
+    can_share: bool = False
 
 
 class BoardElementCreate(CamelModel):
@@ -107,5 +112,9 @@ class BoardFull(CamelModel):
     updated_at: int
     deleted_at: int | None
     owner_uuid: UUID | None = None
-    your_role: str | None = None
+    is_owner: bool = False
+    is_curator: bool = False
+    can_read: bool = False
+    can_write: bool = False
+    can_share: bool = False
     elements: list[BoardElementResponse]

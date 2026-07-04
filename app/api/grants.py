@@ -1,13 +1,16 @@
-"""Share/revoke endpoints для доски.
+"""Grants endpoints (BRD-3 capability-model).
 
-Карта: cards/board/feature/2026-06-23-board-ownership-and-grants.md
-(Stage 4 + D4-rework 2026-06-27 / R2). Доступ к управлению grant'ами
-— только owner или curator (D5, D6).
+Endpoints:
+- GET    /boards/{id}/grants                   — owner/curator only
+- POST   /boards/{id}/grants                   — owner/curator: любой capability
+                                                  can_share (не owner): только {r=t,w=f,s=f}
+- PATCH  /boards/{id}/grants/{kind}/{value}    — owner/curator only
+- DELETE /boards/{id}/grants/{kind}/{value}    — owner/curator only
+- POST   /boards/{id}/transfer                 — owner-only
 
-D4 (после #137): шарим по attribute-каналу `email | telegram | handle`.
-Lazy-bind UUID на стороне require_board при первом hit'е.
+BRD-1 D4 attribute-канал: шарим по `email | telegram | handle`.
+Lazy-bind UUID на стороне require_board.
 """
-from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
@@ -15,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth_ctx import AuthCtx, current_user
+from app.core.auth_ctx import AuthCtx, current_user, your_capabilities_map
 from app.core.database import get_db
 from app.core.deps import verify_token
 from app.core.exceptions import APIError
@@ -25,6 +28,7 @@ from app.schemas.grant import (
     AttrKind,
     GrantCreate,
     GrantResponse,
+    GrantUpdate,
     TransferRequest,
     TransferResponse,
 )
@@ -32,24 +36,35 @@ from app.schemas.grant import (
 
 router = APIRouter(prefix="/boards", tags=["grants"])
 
-_ALLOWED_LEVELS = {200, 300}
 
-
-async def _owner_or_curator(
-    db: AsyncSession, ctx: AuthCtx, board_id: UUID
-) -> Board:
-    """Gate для grant-операций: owner ИЛИ curator (никаких grant-level
-    делегаций — управлять grant'ами могут только эти двое)."""
+async def _load_board(db: AsyncSession, board_id: UUID) -> Board:
     board = await db.get(Board, board_id)
     if not board or board.deleted_at is not None:
         raise APIError(
             404, "board_not_found", f"Board with id '{board_id}' does not exist"
         )
+    return board
+
+
+async def _owner_or_curator(
+    db: AsyncSession, ctx: AuthCtx, board_id: UUID
+) -> Board:
+    """Полное управление grant'ами: owner ИЛИ curator (BRD-1 D5/D6)."""
+    board = await _load_board(db, board_id)
     if not ctx.is_curator and board.owner_uuid != ctx.user_uuid:
         raise APIError(
             403, "forbidden", "Only board owner or curator can manage grants"
         )
     return board
+
+
+async def _has_can_share(
+    db: AsyncSession, ctx: AuthCtx, board: Board
+) -> bool:
+    """Есть ли у ctx capability `share` на доске (через grants)."""
+    caps = await your_capabilities_map(db, ctx, [board])
+    c = caps.get(board.id)
+    return bool(c and c.can_share)
 
 
 def _sanitize_attr(kind: AttrKind, value: str) -> str:
@@ -108,15 +123,30 @@ async def upsert_grant(
     ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> BoardGrant:
-    await _owner_or_curator(db, ctx, board_id)
-    if body.level not in _ALLOWED_LEVELS:
-        raise APIError(
-            400, "invalid_level", "level must be 200 (read) or 300 (write)"
-        )
+    """POST grant. Owner/curator: любой валидный capability-set.
+    can_share non-owner: только {r=t, w=f, s=f}, иначе 403 (BRD-3 D4).
+    """
+    board = await _load_board(db, board_id)
+    is_manage = ctx.is_curator or board.owner_uuid == ctx.user_uuid
+    if not is_manage:
+        # Проверка что у caller'а есть can_share (иначе 403).
+        if not await _has_can_share(db, ctx, board):
+            raise APIError(
+                403,
+                "forbidden",
+                "Managing grants requires owner, curator, or can_share",
+            )
+        # Ограничение payload'а: только read-only invite.
+        if not (body.can_read and not body.can_write and not body.can_share):
+            raise APIError(
+                403,
+                "restricted_invite_read_only",
+                "can_share users may only invite read-only "
+                "(can_read=true, can_write=false, can_share=false)",
+            )
     value = _sanitize_attr(body.attr_kind, body.attr_value)
 
-    # Self-grant check: запрещаем по любому из своих attribute. Owner и
-    # так видит доску — нет смысла; и без этого UI может сбить с толку.
+    # Self-grant check: запрещаем по любому из своих attribute.
     self_values = {
         "email": ctx.user_email or None,
         "telegram": ctx.user_telegram or None,
@@ -133,7 +163,9 @@ async def upsert_grant(
             subject_attr_kind=body.attr_kind,
             subject_attr_value=value,
             subject_uuid=None,
-            level=body.level,
+            can_read=body.can_read,
+            can_write=body.can_write,
+            can_share=body.can_share,
             granted_by_uuid=ctx.user_uuid,
             granted_at=ts,
         )
@@ -142,7 +174,9 @@ async def upsert_grant(
                 "board_id", "subject_attr_kind", "subject_attr_value"
             ],
             set_={
-                "level": body.level,
+                "can_read": body.can_read,
+                "can_write": body.can_write,
+                "can_share": body.can_share,
                 "granted_by_uuid": ctx.user_uuid,
                 "granted_at": ts,
             },
@@ -162,6 +196,45 @@ async def upsert_grant(
     return row
 
 
+@router.patch(
+    "/{board_id}/grants/{attr_kind}/{attr_value}",
+    response_model=GrantResponse,
+)
+async def patch_grant(
+    board_id: UUID,
+    attr_kind: AttrKind,
+    attr_value: str,
+    body: GrantUpdate,
+    db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
+    _: None = Depends(verify_token),
+) -> BoardGrant:
+    """Сменить capability-set у существующего grant'а. Owner/curator only
+    (share-delegation не даёт PATCH — только POST read-only invite)."""
+    await _owner_or_curator(db, ctx, board_id)
+    value = _sanitize_attr(attr_kind, attr_value)
+    grant = (
+        await db.execute(
+            select(BoardGrant).where(
+                BoardGrant.board_id == board_id,
+                BoardGrant.subject_attr_kind == attr_kind,
+                BoardGrant.subject_attr_value == value,
+            )
+        )
+    ).scalar_one_or_none()
+    if grant is None:
+        raise APIError(
+            404, "grant_not_found",
+            f"Grant {attr_kind}:{value} not found on this board",
+        )
+    grant.can_read = body.can_read
+    grant.can_write = body.can_write
+    grant.can_share = body.can_share
+    await db.commit()
+    await db.refresh(grant)
+    return grant
+
+
 @router.delete(
     "/{board_id}/grants/{attr_kind}/{attr_value}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -174,6 +247,7 @@ async def delete_grant(
     ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> None:
+    """Owner/curator only (share-delegation не даёт DELETE)."""
     await _owner_or_curator(db, ctx, board_id)
     value = _sanitize_attr(attr_kind, attr_value)
     grant = (
@@ -201,23 +275,19 @@ async def transfer_ownership(
     ctx: AuthCtx = Depends(current_user),
     _: None = Depends(verify_token),
 ) -> TransferResponse:
-    """Передать владельца доски. Карта #130 Stage 5.
+    """Передать владельца доски. BRD-1 Stage 5.
 
-    Owner-only. Curator передаёт через `/admin/boards/{id}/assign-owner`
-    (Stage 6) — отдельный flow для orphan-досок.
+    Owner-only. Curator — через `/admin/boards/{id}/assign-owner` (Stage 6).
 
     Target должен уже быть в grants с резолвленным subject_uuid
-    (D6: target_must_be_member_first). Транзакция:
+    (target_must_be_member_first). Транзакция:
     1. boards.owner_uuid → target_uuid;
-    2. удаляем все grant-строки target (он теперь owner);
-    3. вставляем grant для старого owner: subject_uuid prefilled,
-       attr_kind/value берём из ctx (email > handle), level=300 (Q2).
+    2. удаляем grant-строки target (он теперь owner);
+    3. вставляем grant для старого owner: {r=t, w=t, s=f} (Q2 из BRD-1;
+       can_share=false — старый owner не автоматически получает право
+       переприглашать в новой политике).
     """
-    board = await db.get(Board, board_id)
-    if not board or board.deleted_at is not None:
-        raise APIError(
-            404, "board_not_found", f"Board with id '{board_id}' does not exist"
-        )
+    board = await _load_board(db, board_id)
     if board.owner_uuid != ctx.user_uuid:
         raise APIError(
             403,
@@ -229,7 +299,6 @@ async def transfer_ownership(
             400, "self_transfer", "Cannot transfer ownership to yourself"
         )
 
-    # Target должен быть в grants с резолвленным subject_uuid.
     target_grants = (
         await db.execute(
             select(BoardGrant).where(
@@ -248,8 +317,6 @@ async def transfer_ownership(
 
     old_owner_uuid = ctx.user_uuid
 
-    # Выбор attribute для старого owner — email > handle (handle всегда
-    # non-empty после #137; email может быть пустой для TG-only юзеров).
     if ctx.user_email:
         demoted_attr_kind = "email"
         demoted_attr_value = ctx.user_email
@@ -257,8 +324,6 @@ async def transfer_ownership(
         demoted_attr_kind = "handle"
         demoted_attr_value = ctx.user_handle
     else:
-        # Defensive: handle всегда должен быть, но если как-то пусто —
-        # 400 чтобы owner понял что у него аккаунт без identifying attrs.
         raise APIError(
             400,
             "no_demote_attr",
@@ -266,16 +331,10 @@ async def transfer_ownership(
         )
 
     ts = now_ms()
-
-    # 1. Сменить owner.
     board.owner_uuid = body.target_uuid
-
-    # 2. Удалить grants target'а (он теперь owner).
     for g in target_grants:
         await db.delete(g)
 
-    # 3. Вставить grant для старого owner. ON CONFLICT DO UPDATE на случай
-    # если у него уже был grant (теоретически невозможно, но defensive).
     stmt = (
         pg_insert(BoardGrant)
         .values(
@@ -283,7 +342,9 @@ async def transfer_ownership(
             subject_attr_kind=demoted_attr_kind,
             subject_attr_value=demoted_attr_value,
             subject_uuid=old_owner_uuid,
-            level=300,
+            can_read=True,
+            can_write=True,
+            can_share=False,
             granted_by_uuid=old_owner_uuid,
             granted_at=ts,
         )
@@ -293,7 +354,9 @@ async def transfer_ownership(
             ],
             set_={
                 "subject_uuid": old_owner_uuid,
-                "level": 300,
+                "can_read": True,
+                "can_write": True,
+                "can_share": False,
                 "granted_by_uuid": old_owner_uuid,
                 "granted_at": ts,
             },
