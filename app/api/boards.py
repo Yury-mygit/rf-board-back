@@ -205,14 +205,23 @@ async def delete_board(
         raise APIError(404, "board_not_found", f"Board with id '{board_id}' does not exist")
     if not ctx.is_curator and board.owner_uuid != ctx.user_uuid:
         raise APIError(403, "forbidden", "Only board owner or curator can delete")
+    live_count = (
+        await db.execute(
+            select(func.count(BoardElement.id)).where(
+                BoardElement.board_id == board_id,
+                BoardElement.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one()
+    if live_count > 0:
+        raise APIError(
+            409,
+            "board_not_empty",
+            f"Board has {live_count} live element(s); delete them first",
+        )
     ts = now_ms()
     board.deleted_at = ts
     board.updated_at = ts
-    await db.execute(
-        update(BoardElement)
-        .where(BoardElement.board_id == board_id, BoardElement.deleted_at.is_(None))
-        .values(deleted_at=ts, updated_at=ts)
-    )
     await db.commit()
     bp_publish(board_id, {"type": "board_deleted", "board_id": str(board_id), "ts": ts})
 
