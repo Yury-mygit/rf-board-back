@@ -14,7 +14,6 @@ from app.core.auth_ctx import (
 )
 from app.core.board_pubsub import publish as bp_publish
 from app.core.database import get_db
-from app.core.deps import verify_token
 from app.core.exceptions import APIError
 from app.core.utils import now_ms
 from app.models.models import Board, BoardElement
@@ -105,7 +104,6 @@ async def list_boards(
     include_deleted: bool = Query(default=False, alias="includeDeleted"),
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> list[dict]:
     q = visible_boards_query(ctx)
     if not include_deleted:
@@ -121,7 +119,6 @@ async def create_board(
     body: BoardCreate,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> dict:
     if await db.get(Board, body.id):
         raise APIError(409, "conflict", f"Board with id '{body.id}' already exists")
@@ -149,7 +146,6 @@ async def get_board(
     board_id: UUID,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> dict:
     board = await require_board(db, ctx, board_id, "read")
     q = (
@@ -171,7 +167,6 @@ async def patch_board(
     body: BoardPatch,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> dict:
     board = await require_board(db, ctx, board_id, "write")
     if body.updated_at >= board.updated_at:
@@ -198,7 +193,6 @@ async def delete_board(
     board_id: UUID,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> None:
     board = await db.get(Board, board_id)
     if not board:
@@ -254,7 +248,6 @@ async def create_element(
     body: BoardElementCreate,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> BoardElement:
     await require_board(db, ctx, board_id, "write")
     if await db.get(BoardElement, body.id):
@@ -287,7 +280,6 @@ async def patch_element(
     body: BoardElementPatch,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> BoardElement:
     await require_board(db, ctx, board_id, "write")
     element = await db.get(BoardElement, element_id)
@@ -332,7 +324,6 @@ async def delete_element(
     element_id: UUID,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> None:
     await require_board(db, ctx, board_id, "write")
     element = await db.get(BoardElement, element_id)
@@ -360,7 +351,6 @@ async def upsert_element_by_ref(
     body: BoardElementUpsertByRef,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> BoardElement:
     await require_board(db, ctx, board_id, "write")
 
@@ -452,7 +442,6 @@ async def get_element_by_ref(
     external_ref: UUID,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> BoardElement:
     await require_board(db, ctx, board_id, "read")
     element = (
@@ -482,7 +471,6 @@ async def delete_element_by_ref(
     external_ref: UUID,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> None:
     await require_board(db, ctx, board_id, "write")
     element = (
@@ -521,7 +509,6 @@ async def restore_element(
     element_id: UUID,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> BoardElement:
     await require_board(db, ctx, board_id, "write")
     element = await db.get(BoardElement, element_id)

@@ -10,7 +10,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.deps import verify_token
 from app.core.exceptions import APIError
 from app.models.models import Board, BoardElement
 from app.schemas.common import CamelModel
@@ -169,7 +168,6 @@ async def get_frame_png(
 async def get_frame(
     frame_id: UUID,
     db: AsyncSession = Depends(get_db),
-    _: None = Depends(verify_token),
 ) -> dict:
     data = await _load_frame_data(db, frame_id)
     # Внутренний формат _load_frame_data — camelCase, FrameView ожидает snake_case через alias.

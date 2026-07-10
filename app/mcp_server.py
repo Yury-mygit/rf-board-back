@@ -1,63 +1,93 @@
 """FastMCP server exposing board tools over /mcp.
 
-Тонкий wrapper над `/api/v1/boards/*` через httpx-loopback на 127.0.0.1:8000
-со static API_KEY. Аналог `docs.dev/mcp` (см. карта
-`cards/board/feature/2026-05-30-board-mcp-server.md`).
+Identity-first: Caddy `auth_required board-dev` валидирует Bearer через
+auth-service и прокидывает `X-User-{Uuid,Email,Telegram,Handle,Is-Curator}`.
+Handler читает headers через get_http_headers(), строит AuthCtx и
+вызывает функции роутера `app/api/boards.py` напрямую с открытой
+AsyncSessionLocal-сессией — real user_uuid в ACL, без httpx-loopback
+и без static API_KEY.
 
-Авторизация: за `auth_required board-dev` в Caddy ходит юзер с api_token
-grant'ом board-dev; Caddy подменяет Authorization на статичный API_KEY
-(snippet `inject_api_key_upstream`).
+Паттерн — по образцу tasks-MCP (см. per-project/tasks.md, #138).
 """
+from __future__ import annotations
+
 from typing import Any
+from uuid import UUID
 
-import httpx
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
 
-from app.core.config import settings
+from app.api.boards import (
+    delete_element_by_ref as _api_delete_element_by_ref,
+    get_board as _api_get_board,
+    list_boards as _api_list_boards,
+    upsert_element_by_ref as _api_upsert_element_by_ref,
+)
+from app.core.auth_ctx import AuthCtx
+from app.core.database import AsyncSessionLocal
+from app.core.exceptions import APIError
+from app.schemas.board import (
+    BoardElementResponse,
+    BoardElementUpsertByRef,
+    BoardFull,
+    BoardResponse,
+)
 
 mcp = FastMCP("board")
 
-INTERNAL_BASE = "http://127.0.0.1:8000/api/v1"
 PUBLIC_FRAME_BASE = "https://board.dev.raftforge.art/api/v1/frames"
 
 
-def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        base_url=INTERNAL_BASE,
-        headers={"Authorization": f"Bearer {settings.api_key}"},
-        timeout=10.0,
+def _build_auth_ctx() -> AuthCtx:
+    headers = get_http_headers()
+    x_user_uuid = headers.get("x-user-uuid")
+    if not x_user_uuid:
+        raise ValueError("missing X-User-Uuid (request bypassed edge auth)")
+    try:
+        user_uuid = UUID(x_user_uuid)
+    except ValueError:
+        raise ValueError("malformed X-User-Uuid")
+    return AuthCtx(
+        user_uuid=user_uuid,
+        user_email=(headers.get("x-user-email") or "").strip().lower(),
+        user_telegram=(headers.get("x-user-telegram") or "").strip(),
+        user_handle=(headers.get("x-user-handle") or "").strip().lower(),
+        is_curator=headers.get("x-user-is-curator") == "1",
     )
 
 
 @mcp.tool
 async def board_list_boards(include_deleted: bool = False) -> list[dict]:
-    """List all boards (id, title, order_index, timestamps). By default
+    """List all boards visible to caller (owner or grant). By default
     excludes soft-deleted; pass include_deleted=True to see them."""
-    async with _client() as c:
-        r = await c.get("/boards", params={"includeDeleted": include_deleted})
-        r.raise_for_status()
-        return r.json()
+    ctx = _build_auth_ctx()
+    try:
+        async with AsyncSessionLocal() as db:
+            raw = await _api_list_boards(include_deleted=include_deleted, db=db, ctx=ctx)
+            return [BoardResponse.model_validate(d).model_dump(mode="json", by_alias=True) for d in raw]
+    except APIError as e:
+        raise ValueError(f"{e.code}: {e.message}") from e
 
 
 @mcp.tool
 async def board_get(board_id: str) -> dict:
     """Read a single board with ALL its elements (frames, shapes, etc).
     Returns the board metadata + `elements` array sorted by z-index."""
-    async with _client() as c:
-        r = await c.get(f"/boards/{board_id}")
-        r.raise_for_status()
-        return r.json()
+    ctx = _build_auth_ctx()
+    try:
+        async with AsyncSessionLocal() as db:
+            raw = await _api_get_board(board_id=UUID(board_id), db=db, ctx=ctx)
+            return BoardFull.model_validate(raw).model_dump(mode="json", by_alias=True)
+    except APIError as e:
+        raise ValueError(f"{e.code}: {e.message}") from e
 
 
 @mcp.tool
 async def board_list_elements(board_id: str, type: str | None = None) -> list[dict]:
     """List elements of a board, optionally filtered by `type` (e.g.
-    'frame', 'shape'). Convenience wrapper around board_get — returns
-    only the `elements` array (filtered)."""
-    async with _client() as c:
-        r = await c.get(f"/boards/{board_id}")
-        r.raise_for_status()
-        elements = r.json().get("elements", [])
+    'frame', 'shape'). Convenience wrapper around board_get."""
+    board = await board_get(board_id)
+    elements = board.get("elements", [])
     if type is not None:
         elements = [el for el in elements if el.get("type") == type]
     return elements
@@ -83,32 +113,41 @@ async def board_upsert_element_by_ref(
     the existing element's id is preserved and (type, parent_id, geometry,
     attrs, updated_at) are overwritten. For frames a position delta is
     cascaded to children. Timestamps are ms-epoch ints."""
-    body = {
-        "id": id,
-        "external_ref": external_ref,
-        "type": type,
-        "parent_id": parent_id,
-        "x": x,
-        "y": y,
-        "w": w,
-        "h": h,
-        "attrs": attrs,
-        "created_at": created_at,
-        "updated_at": updated_at,
-    }
-    async with _client() as c:
-        r = await c.post(f"/boards/{board_id}/elements/by-ref", json=body)
-        r.raise_for_status()
-        return r.json()
+    ctx = _build_auth_ctx()
+    body = BoardElementUpsertByRef(
+        id=UUID(id),
+        external_ref=UUID(external_ref),
+        type=type,
+        parent_id=UUID(parent_id) if parent_id else None,
+        x=x, y=y, w=w, h=h,
+        attrs=attrs,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+    try:
+        async with AsyncSessionLocal() as db:
+            elem = await _api_upsert_element_by_ref(
+                board_id=UUID(board_id), body=body, db=db, ctx=ctx,
+            )
+            return BoardElementResponse.model_validate(elem).model_dump(mode="json", by_alias=True)
+    except APIError as e:
+        raise ValueError(f"{e.code}: {e.message}") from e
 
 
 @mcp.tool
 async def board_delete_element_by_ref(board_id: str, external_ref: str) -> dict:
     """Soft-delete an element by its `external_ref` on the given board."""
-    async with _client() as c:
-        r = await c.delete(f"/boards/{board_id}/elements/by-ref/{external_ref}")
-        r.raise_for_status()
-    return {"ok": True}
+    ctx = _build_auth_ctx()
+    try:
+        async with AsyncSessionLocal() as db:
+            await _api_delete_element_by_ref(
+                board_id=UUID(board_id),
+                external_ref=UUID(external_ref),
+                db=db, ctx=ctx,
+            )
+            return {"ok": True}
+    except APIError as e:
+        raise ValueError(f"{e.code}: {e.message}") from e
 
 
 @mcp.tool

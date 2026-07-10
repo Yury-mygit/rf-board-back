@@ -20,7 +20,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_ctx import AuthCtx, current_user, your_capabilities_map
 from app.core.database import get_db
-from app.core.deps import verify_token
 from app.core.exceptions import APIError
 from app.core.utils import now_ms
 from app.models.models import Board, BoardGrant
@@ -100,7 +99,6 @@ async def list_grants(
     board_id: UUID,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> list[BoardGrant]:
     await _owner_or_curator(db, ctx, board_id)
     rows = await db.execute(
@@ -121,7 +119,6 @@ async def upsert_grant(
     body: GrantCreate,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> BoardGrant:
     """POST grant. Owner/curator: любой валидный capability-set.
     can_share non-owner: только {r=t, w=f, s=f}, иначе 403 (BRD-3 D4).
@@ -207,7 +204,6 @@ async def patch_grant(
     body: GrantUpdate,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> BoardGrant:
     """Сменить capability-set у существующего grant'а. Owner/curator only
     (share-delegation не даёт PATCH — только POST read-only invite)."""
@@ -245,7 +241,6 @@ async def delete_grant(
     attr_value: str,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> None:
     """Owner/curator only (share-delegation не даёт DELETE)."""
     await _owner_or_curator(db, ctx, board_id)
@@ -273,7 +268,6 @@ async def transfer_ownership(
     body: TransferRequest,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> TransferResponse:
     """Передать владельца доски. BRD-1 Stage 5.
 

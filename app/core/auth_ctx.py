@@ -7,8 +7,8 @@ Caddy snippet `auth_required board-dev` инжектит:
 - `X-User-Handle` — всегда non-empty (после #137).
 - `X-User-Is-Curator` — `"1"` если у юзера curator-флаг в auth.
 
-`verify_token` остаётся defence-in-depth по shared API_KEY (см.
-карта 2026-06-23-board-ownership-and-grants.md, Notes).
+Identity-only: static bearer/verify_token удалён в BRD-9 —
+auth-service единый издатель, board-back доверяет edge auth.
 
 Карта: cards/board/feature/2026-06-23-board-ownership-and-grants.md
 (D1-D9 + D4-rework 2026-06-27, Stage 2 / R2).

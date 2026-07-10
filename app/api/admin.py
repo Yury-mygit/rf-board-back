@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_ctx import AuthCtx, current_user
 from app.core.database import get_db
-from app.core.deps import verify_token
 from app.core.exceptions import APIError
 from app.models.models import Board
 from app.schemas.board import BoardResponse
@@ -39,7 +38,6 @@ def _require_curator(ctx: AuthCtx) -> None:
 async def list_orphan_boards(
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> list[Board]:
     _require_curator(ctx)
     rows = await db.execute(
@@ -59,7 +57,6 @@ async def assign_owner(
     body: AssignOwnerRequest,
     db: AsyncSession = Depends(get_db),
     ctx: AuthCtx = Depends(current_user),
-    _: None = Depends(verify_token),
 ) -> Board:
     """Curator назначает владельца для orphan-доски.
 
