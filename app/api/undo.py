@@ -110,6 +110,9 @@ async def undo_state(
     ctx: AuthCtx = Depends(current_user),
 ) -> dict:
     await require_board(db, ctx, board_id, "read")
-    return await compute_undo_state(
+    state = await compute_undo_state(
         db, board_id=board_id, user_uuid=ctx.user_uuid
     )
+    # BRD-20: клиент использует my_uuid чтобы фильтровать SSE undo_state map.
+    state["my_uuid"] = str(ctx.user_uuid)
+    return state
