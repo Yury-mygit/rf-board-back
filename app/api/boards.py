@@ -15,7 +15,12 @@ from app.core.auth_ctx import (
 from app.core.board_pubsub import publish as bp_publish
 from app.core.database import get_db
 from app.core.exceptions import APIError
-from app.core.undo_log import classify_patch, record_action, snapshot_element
+from app.core.undo_log import (
+    attach_undo_state,
+    classify_patch,
+    record_action,
+    snapshot_element,
+)
 from app.core.utils import now_ms
 from app.models.models import Board, BoardElement
 from app.schemas.board import (
@@ -269,7 +274,7 @@ async def create_element(
     )
     db.add(element)
     await db.flush()  # чтобы element.id был доступен record_action до commit'а
-    await record_action(
+    action = await record_action(
         db,
         board_id=board_id,
         executor_uuid=ctx.user_uuid,
@@ -277,9 +282,12 @@ async def create_element(
         target_ids=[element.id],
         snapshot=snapshot_element(element),
     )
+    associated = list(action.associated_users) if action else []
     await db.commit()
     await db.refresh(element)
-    bp_publish(board_id, {"type": "element_upserted", "element": _el_payload(element)})
+    event = {"type": "element_upserted", "element": _el_payload(element)}
+    await attach_undo_state(db, board_id=board_id, event=event, associated_users=associated)
+    bp_publish(board_id, event)
     return element
 
 
@@ -338,7 +346,7 @@ async def patch_element(
         # children позиции (они в БД смещены, но не логированы отдельно).
         if cascade_children_before:
             delta["cascade_children"] = cascade_children_before
-        await record_action(
+        action = await record_action(
             db,
             board_id=board_id,
             executor_uuid=ctx.user_uuid,
@@ -347,13 +355,16 @@ async def patch_element(
             delta=delta,
             ts_ms=updated_at,
         )
+        associated = list(action.associated_users) if action else []
         await db.commit()
         await db.refresh(element)
         payload = _el_payload(element)
         if cascade_dx or cascade_dy:
             payload["cascade_dx"] = cascade_dx
             payload["cascade_dy"] = cascade_dy
-        bp_publish(board_id, {"type": "element_patched", "element": payload})
+        event = {"type": "element_patched", "element": payload}
+        await attach_undo_state(db, board_id=board_id, event=event, associated_users=associated)
+        bp_publish(board_id, event)
     return element
 
 
@@ -386,7 +397,7 @@ async def delete_element(
         snap["children"] = [snapshot_element(c) for c in children]
     element.deleted_at = ts
     element.updated_at = ts
-    await record_action(
+    action = await record_action(
         db,
         board_id=board_id,
         executor_uuid=ctx.user_uuid,
@@ -395,7 +406,15 @@ async def delete_element(
         snapshot=snap,
         ts_ms=ts,
     )
+    associated = list(action.associated_users) if action else []
     await db.commit()
+    event = {
+        "type": "element_deleted",
+        "element_id": str(element.id),
+        "ts": ts,
+    }
+    await attach_undo_state(db, board_id=board_id, event=event, associated_users=associated)
+    bp_publish(board_id, event)
 
 
 # ── Upsert / lookup / delete по external_ref ──────────────────────────────────
@@ -467,7 +486,7 @@ async def upsert_element_by_ref(
         kind, delta = classify_patch(before, after)
         if cascade_children_before:
             delta["cascade_children"] = cascade_children_before
-        await record_action(
+        action = await record_action(
             db,
             board_id=board_id,
             executor_uuid=ctx.user_uuid,
@@ -476,13 +495,16 @@ async def upsert_element_by_ref(
             delta=delta,
             ts_ms=body.updated_at,
         )
+        associated = list(action.associated_users) if action else []
         await db.commit()
         await db.refresh(existing)
         payload = _el_payload(existing)
         if cascade_dx or cascade_dy:
             payload["cascade_dx"] = cascade_dx
             payload["cascade_dy"] = cascade_dy
-        bp_publish(board_id, {"type": "element_upserted", "element": payload})
+        event = {"type": "element_upserted", "element": payload}
+        await attach_undo_state(db, board_id=board_id, event=event, associated_users=associated)
+        bp_publish(board_id, event)
         return existing
 
     # INSERT: новый элемент с переданным `id` и `external_ref`.
@@ -518,7 +540,7 @@ async def upsert_element_by_ref(
     )
     db.add(element)
     await db.flush()
-    await record_action(
+    action = await record_action(
         db,
         board_id=board_id,
         executor_uuid=ctx.user_uuid,
@@ -527,9 +549,12 @@ async def upsert_element_by_ref(
         snapshot=snapshot_element(element),
         ts_ms=body.updated_at,
     )
+    associated = list(action.associated_users) if action else []
     await db.commit()
     await db.refresh(element)
-    bp_publish(board_id, {"type": "element_upserted", "element": _el_payload(element)})
+    event = {"type": "element_upserted", "element": _el_payload(element)}
+    await attach_undo_state(db, board_id=board_id, event=event, associated_users=associated)
+    bp_publish(board_id, event)
     return element
 
 
@@ -604,7 +629,7 @@ async def delete_element_by_ref(
         snap["children"] = [snapshot_element(c) for c in children]
     element.deleted_at = ts
     element.updated_at = ts
-    await record_action(
+    action = await record_action(
         db,
         board_id=board_id,
         executor_uuid=ctx.user_uuid,
@@ -613,13 +638,16 @@ async def delete_element_by_ref(
         snapshot=snap,
         ts_ms=ts,
     )
+    associated = list(action.associated_users) if action else []
     await db.commit()
-    bp_publish(board_id, {
+    event = {
         "type": "element_deleted",
         "element_id": str(element.id),
         "external_ref": str(external_ref),
         "ts": ts,
-    })
+    }
+    await attach_undo_state(db, board_id=board_id, event=event, associated_users=associated)
+    bp_publish(board_id, event)
 
 
 @router.post(

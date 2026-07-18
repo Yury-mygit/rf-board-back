@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api import admin, boards, events, frames, grants, media_refs
+from app.api import admin, boards, events, frames, grants, media_refs, undo
 
 api_router = APIRouter()
 api_router.include_router(boards.router)
@@ -9,3 +9,4 @@ api_router.include_router(media_refs.router)
 api_router.include_router(events.router)
 api_router.include_router(grants.router)
 api_router.include_router(admin.router)
+api_router.include_router(undo.router)

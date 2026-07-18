@@ -18,11 +18,14 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.utils import now_ms
 from app.models.models import BoardAction, BoardElement
+
+# BRD-19: N=100 per (board, user) stack — оставшееся выталкивается.
+UNDO_STACK_CAP = 100
 
 
 def snapshot_element(el: BoardElement) -> dict:
@@ -188,4 +191,64 @@ async def record_action(
         pruned=False,
     )
     db.add(action)
+    await db.flush()  # чтобы pruning-запрос увидел новый row в этой tx.
+
+    # BRD-19: cap N=100 per user. При превышении — mark самого старого
+    # non-pruned как pruned. Инвариант: до этой mutation'а stack каждого
+    # user'а ≤ cap; новый action может поднять его до cap+1, значит
+    # достаточно одного prune-hit per associated_user.
+    for u in associated:
+        stack_size = (
+            await db.execute(
+                select(func.count(BoardAction.id)).where(
+                    BoardAction.board_id == board_id,
+                    BoardAction.pruned.is_(False),
+                    BoardAction.associated_users.op("@>")(
+                        func.jsonb_build_array(text(f"'{u}'::text"))
+                    ),
+                )
+            )
+        ).scalar_one()
+        if stack_size > UNDO_STACK_CAP:
+            oldest_id = (
+                await db.execute(
+                    select(BoardAction.id).where(
+                        BoardAction.board_id == board_id,
+                        BoardAction.pruned.is_(False),
+                        BoardAction.associated_users.op("@>")(
+                            func.jsonb_build_array(text(f"'{u}'::text"))
+                        ),
+                    )
+                    .order_by(BoardAction.ts_ms.asc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if oldest_id is not None:
+                await db.execute(
+                    update(BoardAction)
+                    .where(BoardAction.id == oldest_id)
+                    .values(pruned=True)
+                )
+
     return action
+
+
+async def attach_undo_state(
+    db: AsyncSession,
+    *,
+    board_id: uuid.UUID,
+    event: dict,
+    associated_users: list[str] | None,
+) -> None:
+    """BRD-19: обогащает SSE event map'ой undo_state per user.
+
+    Клиент фильтрует по своему user_uuid — обновляет кнопки Undo/Redo.
+    Ленивый import — избегаем цикла (undo_engine → undo_log).
+    """
+    if not associated_users:
+        return
+    from app.core.undo_engine import compute_undo_state_map
+
+    event["undo_state"] = await compute_undo_state_map(
+        db, board_id=board_id, user_uuids=associated_users
+    )
