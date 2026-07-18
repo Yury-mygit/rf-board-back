@@ -53,7 +53,8 @@ _KIND_LABELS = {
     "attrs": "изменение свойств",
     "parent": "перепривязку к фрейму",
     "z_order": "изменение слоя",
-    "composite": "изменение нескольких свойств",
+    "mixed": "изменение нескольких свойств",
+    "composite": "групповое действие",
 }
 
 
@@ -79,13 +80,27 @@ async def apply_undo(db: AsyncSession, action: BoardAction) -> dict | None:
     чтобы не логировать откат как новый action.
     """
     kind = action.kind
+    ts = now_ms()
+
+    # BRD-24: composite (multi-target) обрабатывается до pre-compute'а
+    # первого target'а, т.к. items имеют собственные target_id.
+    if kind == "composite":
+        items = (action.delta or {}).get("items") or []
+        pieces = []
+        for item in items:
+            piece = await _apply_item(db, item, ts, direction="undo")
+            if piece is not None:
+                pieces.append(piece)
+        if not pieces:
+            return None
+        return {"type": "elements_batch_patched", "items": pieces}
+
     tid = action.target_ids[0] if action.target_ids else None
     if tid is None:
         return None
     el = await _get_element(db, tid)
     if el is None:
         return None
-    ts = now_ms()
 
     if kind == "create":
         # undo create → soft-delete.
@@ -174,10 +189,10 @@ async def apply_undo(db: AsyncSession, action: BoardAction) -> dict | None:
         el.updated_at = ts
         return {"type": "element_patched", "element": _el_payload(el)}
 
-    if kind == "composite":
+    if kind == "mixed":
         if el.deleted_at is not None:
             return None
-        # composite: delta.before содержит snapshot changed_fields.
+        # mixed: single-target snapshot changed_fields.
         delta = action.delta or {}
         before = delta.get("before") or {}
         for k, v in before.items():
@@ -195,16 +210,143 @@ async def apply_undo(db: AsyncSession, action: BoardAction) -> dict | None:
     return None
 
 
+async def _apply_item(
+    db: AsyncSession, item: dict, ts: int, *, direction: str
+) -> dict | None:
+    """BRD-24: применяет один per-target sub-action в composite.
+
+    `direction="undo"` — восстанавливает `before`; `"redo"` — применяет `after`.
+    Возвращает payload piece для bulk-event:
+      - `{"element": {...}}` для upsert/patch/restore
+      - `{"element_id": "<id>", "deleted": true}` для soft-delete
+    None если item не применим (target missing, no-op на current state).
+    """
+    kind = item.get("kind")
+    tid = item.get("target_id")
+    if not tid:
+        return None
+    el = await _get_element(db, tid)
+    if el is None:
+        return None
+    snap = item.get("before" if direction == "undo" else "after") or {}
+
+    # delete/create — semantic flip между undo и redo одинаково для обоих
+    # направлений: undo create = soft-delete, redo create = un-soft-delete;
+    # undo delete = un-soft-delete, redo delete = soft-delete.
+    if kind == "create":
+        target_deleted = direction == "undo"
+        if target_deleted:
+            if el.deleted_at is not None:
+                return None
+            el.deleted_at = ts
+            el.updated_at = ts
+            return {"element_id": str(el.id), "deleted": True}
+        else:
+            if el.deleted_at is None:
+                return None
+            el.deleted_at = None
+            el.updated_at = ts
+            return {"element": _el_payload(el)}
+
+    if kind == "delete":
+        target_deleted = direction == "redo"
+        if target_deleted:
+            if el.deleted_at is not None:
+                return None
+            el.deleted_at = ts
+            el.updated_at = ts
+            return {"element_id": str(el.id), "deleted": True}
+        else:
+            if el.deleted_at is None:
+                return None
+            el.deleted_at = None
+            el.updated_at = ts
+            return {"element": _el_payload(el)}
+
+    if el.deleted_at is not None:
+        return None
+
+    if kind in ("move", "resize"):
+        for k in ("x", "y", "w", "h"):
+            if k in snap:
+                setattr(el, k, snap[k])
+        cascade = item.get("cascade_children") or []
+        # На undo cascade содержит before-снимки координат детей.
+        # На redo применяем dx/dy к before-снимку (в snapshot before — оригинал).
+        if direction == "undo":
+            for c in cascade:
+                child = await _get_element(db, c["id"])
+                if child is None or child.deleted_at is not None:
+                    continue
+                child.x = float(c["x"])
+                child.y = float(c["y"])
+                child.updated_at = ts
+        else:
+            # redo: смещение от before-cursor на (after.x - before.x, after.y - before.y).
+            before_pos = item.get("before") or {}
+            dx = float(snap.get("x", 0)) - float(before_pos.get("x", 0))
+            dy = float(snap.get("y", 0)) - float(before_pos.get("y", 0))
+            for c in cascade:
+                child = await _get_element(db, c["id"])
+                if child is None or child.deleted_at is not None:
+                    continue
+                child.x = float(c["x"]) + dx
+                child.y = float(c["y"]) + dy
+                child.updated_at = ts
+        el.updated_at = ts
+        return {"element": _el_payload(el)}
+
+    if kind == "attrs":
+        # snap = {key: value_or_null}; None → key deleted.
+        merged = dict(el.attrs or {})
+        for k, v in snap.items():
+            if v is None:
+                merged.pop(k, None)
+            else:
+                merged[k] = v
+        el.attrs = merged
+        el.updated_at = ts
+        return {"element": _el_payload(el)}
+
+    if kind == "parent":
+        v = snap.get("parent_id")
+        el.parent_id = uuid.UUID(v) if v else None
+        el.updated_at = ts
+        return {"element": _el_payload(el)}
+
+    if kind == "z_order":
+        v = snap.get("z_index")
+        if v is not None:
+            el.z_index = int(v)
+        el.updated_at = ts
+        return {"element": _el_payload(el)}
+
+    return None
+
+
 async def apply_redo(db: AsyncSession, action: BoardAction) -> dict | None:
     """Применяет action заново (после undo). Возвращает SSE payload dict."""
     kind = action.kind
+    ts = now_ms()
+
+    # BRD-24: composite (multi-target) — до pre-compute'а первого target'а.
+    if kind == "composite":
+        items = (action.delta or {}).get("items") or []
+        pieces = []
+        for item in items:
+            piece = await _apply_item(db, item, ts, direction="redo")
+            if piece is not None:
+                pieces.append(piece)
+        if not pieces:
+            return None
+        return {"type": "elements_batch_patched", "items": pieces}
+
     tid = action.target_ids[0] if action.target_ids else None
     if tid is None:
         return None
     el = await _get_element(db, tid)
     if el is None:
         return None
-    ts = now_ms()
 
     if kind == "create":
         # redo create → un-soft-delete (был удалён предыдущим undo).
@@ -291,7 +433,7 @@ async def apply_redo(db: AsyncSession, action: BoardAction) -> dict | None:
         el.updated_at = ts
         return {"type": "element_patched", "element": _el_payload(el)}
 
-    if kind == "composite":
+    if kind == "mixed":
         if el.deleted_at is not None:
             return None
         delta = action.delta or {}

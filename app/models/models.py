@@ -165,9 +165,11 @@ class BoardAction(Base):
     # union(executor, ∀ target: element.touchers на момент action'а).
     # Определяет, в чей стек попадает эта запись.
     associated_users: Mapped[list] = mapped_column(JSONB, nullable=False)
-    # create / delete / move / resize / attrs / parent / z_order / composite.
+    # create / delete / move / resize / attrs / parent / z_order / mixed / composite.
+    # mixed — single-target с одновременным изменением нескольких полей;
+    # composite — multi-target batch (BRD-24), delta = [{target_id, kind, before, after}].
     kind: Mapped[str] = mapped_column(String(20), nullable=False)
-    # element_id как строки (JSONB array). Singleton для non-composite.
+    # element_id как строки (JSONB array). Singleton для non-composite/non-mixed.
     target_ids: Mapped[list] = mapped_column(JSONB, nullable=False)
     # Дельта для реверса: {dx, dy} для move, {key: {before, after}} для
     # attrs, {before, after} для parent/z_order, {} для create/delete.

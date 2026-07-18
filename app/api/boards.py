@@ -1,7 +1,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_ctx import (
@@ -25,9 +25,12 @@ from app.core.utils import now_ms
 from app.models.models import Board, BoardElement
 from app.schemas.board import (
     BoardCreate,
+    BoardElementBatchItem,
     BoardElementCreate,
     BoardElementPatch,
     BoardElementResponse,
+    BoardElementsBatchRequest,
+    BoardElementsBatchResponse,
     BoardElementUpsertByRef,
     BoardFull,
     BoardPatch,
@@ -415,6 +418,265 @@ async def delete_element(
     }
     await attach_undo_state(db, board_id=board_id, event=event, associated_users=associated)
     bp_publish(board_id, event)
+
+
+# ── Batch mutations (BRD-24) ──────────────────────────────────────────────
+# Единая точка входа для всех multi-target мутаций (patch + delete).
+# Пишет один composite action в log; per-item heterogeneous delta.
+
+
+def _item_snapshot(el: BoardElement) -> dict:
+    """Минимальный per-item snapshot для composite delta (без external_ref
+    и created_at — они не меняются в patch/delete)."""
+    return {
+        "x": el.x, "y": el.y, "w": el.w, "h": el.h,
+        "z_index": el.z_index,
+        "parent_id": str(el.parent_id) if el.parent_id else None,
+        "attrs": dict(el.attrs or {}),
+    }
+
+
+def _diff_snapshots(before: dict, after: dict) -> tuple[dict, dict]:
+    """Возвращает (before_diff, after_diff) — только изменившиеся ключи."""
+    b_diff: dict = {}
+    a_diff: dict = {}
+    for k in ("x", "y", "w", "h", "z_index", "parent_id"):
+        if before.get(k) != after.get(k):
+            b_diff[k] = before.get(k)
+            a_diff[k] = after.get(k)
+    b_attrs = before.get("attrs") or {}
+    a_attrs = after.get("attrs") or {}
+    if b_attrs != a_attrs:
+        # attrs хранятся per-key {before, after} для partial merge при undo
+        keys = set(b_attrs) | set(a_attrs)
+        b_attrs_diff: dict = {}
+        a_attrs_diff: dict = {}
+        for k in keys:
+            if b_attrs.get(k) != a_attrs.get(k):
+                b_attrs_diff[k] = b_attrs.get(k)
+                a_attrs_diff[k] = a_attrs.get(k)
+        if b_attrs_diff:
+            b_diff["attrs"] = b_attrs_diff
+        if a_attrs_diff:
+            a_diff["attrs"] = a_attrs_diff
+    return b_diff, a_diff
+
+
+def _classify_item_kind(before_diff: dict, after_diff: dict) -> str:
+    """Per-item kind по diff: move / resize / attrs / parent / z_order / mixed."""
+    changed = set(after_diff.keys())
+    if changed == {"parent_id"}:
+        return "parent"
+    if changed == {"z_index"}:
+        return "z_order"
+    if changed <= {"x", "y"}:
+        return "move"
+    if changed <= {"x", "y", "w", "h"}:
+        return "resize"
+    if changed == {"attrs"}:
+        return "attrs"
+    return "mixed"
+
+
+@router.post(
+    "/{board_id}/elements/batch",
+    response_model=BoardElementsBatchResponse,
+)
+async def batch_elements(
+    board_id: UUID,
+    body: BoardElementsBatchRequest,
+    db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
+) -> BoardElementsBatchResponse:
+    """BRD-24: единый batch mutation endpoint (patch + delete).
+
+    Атомарно в одной tx: `pg_advisory_xact_lock(board_id)` сериализует
+    concurrent batch calls на доске. Один composite `record_action` +
+    один SSE bulk-event.
+    """
+    await require_board(db, ctx, board_id, "write")
+
+    if not body.items:
+        return BoardElementsBatchResponse(applied=[], skipped=[])
+
+    # BRD-24 D7: per-board advisory lock. Board UUID → int64 через hashtext.
+    # Держится до commit'а; concurrent batch на этой доске сериализуются.
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key)::bigint)").bindparams(
+            key=str(board_id)
+        )
+    )
+
+    ts = now_ms()
+    ids = [it.id for it in body.items]
+    rows = (
+        await db.execute(
+            select(BoardElement).where(
+                BoardElement.board_id == board_id,
+                BoardElement.id.in_(ids),
+            )
+        )
+    ).scalars().all()
+    by_id = {r.id: r for r in rows}
+
+    # Validation: каждый id должен принадлежать доске (BRD-24 D6: 400).
+    for it in body.items:
+        if it.id not in by_id:
+            raise APIError(
+                400,
+                "invalid_batch_item",
+                f"Element '{it.id}' does not exist in board '{board_id}'",
+            )
+        if it.op == "patch" and it.patch is None:
+            raise APIError(
+                400,
+                "invalid_batch_item",
+                f"Item '{it.id}' has op=patch but no patch fields",
+            )
+
+    delta_items: list[dict] = []
+    payload_items: list[dict] = []
+    applied: list[UUID] = []
+    skipped: list[dict] = []
+    associated_all: set[str] = set()
+
+    for it in body.items:
+        el = by_id[it.id]
+
+        if it.op == "delete":
+            if el.deleted_at is not None:
+                skipped.append({"id": str(el.id), "reason": "already_deleted"})
+                continue
+            snap = snapshot_element(el)
+            if el.type == "frame":
+                children = (
+                    await db.execute(
+                        select(BoardElement).where(
+                            BoardElement.board_id == board_id,
+                            BoardElement.parent_id == el.id,
+                            BoardElement.deleted_at.is_(None),
+                        )
+                    )
+                ).scalars().all()
+                snap["children"] = [snapshot_element(c) for c in children]
+            el.deleted_at = ts
+            el.updated_at = ts
+            delta_items.append({
+                "target_id": str(el.id),
+                "kind": "delete",
+                "before": snap,   # snapshot для восстановления при undo
+                "after": None,
+            })
+            payload_items.append({
+                "element_id": str(el.id),
+                "deleted": True,
+            })
+            applied.append(el.id)
+            continue
+
+        # op == "patch"
+        if el.deleted_at is not None:
+            skipped.append({"id": str(el.id), "reason": "deleted"})
+            continue
+
+        patch = it.patch.model_dump(exclude_unset=True)
+        if not patch:
+            skipped.append({"id": str(el.id), "reason": "empty_patch"})
+            continue
+
+        if "parent_id" in patch and patch["parent_id"] is not None:
+            await _validate_parent(db, board_id, el.id, patch["parent_id"])
+
+        before_full = _item_snapshot(el)
+        old_x, old_y = el.x, el.y
+
+        for k, v in patch.items():
+            setattr(el, k, v)
+        el.updated_at = ts
+
+        cascade_children_snap: list[dict] = []
+        if el.type == "frame":
+            cascade_dx = el.x - old_x
+            cascade_dy = el.y - old_y
+            if cascade_dx or cascade_dy:
+                pre_children = (
+                    await db.execute(
+                        select(BoardElement).where(
+                            BoardElement.board_id == board_id,
+                            BoardElement.parent_id == el.id,
+                            BoardElement.deleted_at.is_(None),
+                        )
+                    )
+                ).scalars().all()
+                for c in pre_children:
+                    cascade_children_snap.append({
+                        "id": str(c.id), "x": c.x, "y": c.y,
+                    })
+                await _move_children(
+                    db, board_id, el.id, cascade_dx, cascade_dy, ts,
+                )
+
+        after_full = _item_snapshot(el)
+        before_diff, after_diff = _diff_snapshots(before_full, after_full)
+        if not after_diff:
+            skipped.append({"id": str(el.id), "reason": "noop"})
+            continue
+
+        item_kind = _classify_item_kind(before_diff, after_diff)
+        item_entry: dict = {
+            "target_id": str(el.id),
+            "kind": item_kind,
+            "before": before_diff,
+            "after": after_diff,
+        }
+        if cascade_children_snap:
+            item_entry["cascade_children"] = cascade_children_snap
+        delta_items.append(item_entry)
+
+        el_payload = _el_payload(el)
+        if cascade_children_snap:
+            el_payload_dx = el.x - (before_diff.get("x") or el.x)
+            el_payload_dy = el.y - (before_diff.get("y") or el.y)
+            payload_items.append({
+                "element": el_payload,
+                "cascade_dx": el_payload_dx,
+                "cascade_dy": el_payload_dy,
+            })
+        else:
+            payload_items.append({"element": el_payload})
+        applied.append(el.id)
+
+    if not delta_items:
+        # Все items skipped — не пишем action и не broadcast'им.
+        await db.commit()
+        return BoardElementsBatchResponse(applied=applied, skipped=skipped)
+
+    action = await record_action(
+        db,
+        board_id=board_id,
+        executor_uuid=ctx.user_uuid,
+        kind="composite",
+        target_ids=[UUID(it["target_id"]) for it in delta_items],
+        delta={"items": delta_items},
+        ts_ms=ts,
+    )
+    associated_all = set(action.associated_users) if action else set()
+
+    await db.commit()
+
+    event: dict = {
+        "type": "elements_batch_patched",
+        "items": payload_items,
+        "actor_uuid": str(ctx.user_uuid),
+        "ts": ts,
+    }
+    await attach_undo_state(
+        db, board_id=board_id, event=event,
+        associated_users=list(associated_all),
+    )
+    bp_publish(board_id, event)
+
+    return BoardElementsBatchResponse(applied=applied, skipped=skipped)
 
 
 # ── Upsert / lookup / delete по external_ref ──────────────────────────────────

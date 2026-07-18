@@ -1,3 +1,4 @@
+from typing import Literal
 from uuid import UUID
 
 from app.schemas.common import CamelModel
@@ -102,6 +103,32 @@ class BoardElementUpsertByRef(CamelModel):
     attrs: dict = {}
     created_at: int
     updated_at: int
+
+
+class BoardElementPatchFields(CamelModel):
+    """BRD-24: patch payload без updated_at — endpoint генерирует единый ts."""
+    x: float | None = None
+    y: float | None = None
+    w: float | None = None
+    h: float | None = None
+    z_index: int | None = None
+    attrs: dict | None = None
+    parent_id: UUID | None = None
+
+
+class BoardElementBatchItem(CamelModel):
+    id: UUID
+    op: Literal["patch", "delete"]
+    patch: BoardElementPatchFields | None = None
+
+
+class BoardElementsBatchRequest(CamelModel):
+    items: list[BoardElementBatchItem]
+
+
+class BoardElementsBatchResponse(CamelModel):
+    applied: list[UUID]
+    skipped: list[dict]  # [{"id": UUID, "reason": str}]
 
 
 class BoardFull(CamelModel):

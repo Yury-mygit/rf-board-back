@@ -53,8 +53,10 @@ def classify_patch(before: dict, after: dict) -> tuple[str, dict]:
     - parent — parent_id → before/after.
     - z_order — z_index → before/after.
     - attrs — attrs dict → per-key {before, after}.
-    - composite — mixed changes → список задействованных полей
-      (сервер применяет через snapshot-восстановление в BRD-19).
+    - mixed — single-target с одновременным изменением нескольких полей →
+      snapshot changed_fields с before/after. (BRD-24 переопределил `composite`
+      под multi-target heterogeneous delta — batch endpoint пишет composite
+      напрямую; classify_patch возвращает `mixed` для single-target mixed-diff.)
     """
     changed = set()
     for k in ("x", "y", "w", "h", "z_index", "parent_id", "attrs"):
@@ -99,9 +101,10 @@ def classify_patch(before: dict, after: dict) -> tuple[str, dict]:
                 }
         return "attrs", delta
 
-    # Смешанное изменение — композит без сложной классификации;
-    # BRD-19 compute_inverse обработает через snapshot before/after.
-    return "composite", {
+    # Смешанное изменение single-target — snapshot changed_fields.
+    # BRD-24: этот kind переименован из "composite" в "mixed", т.к.
+    # composite теперь зарезервирован под multi-target heterogeneous delta.
+    return "mixed", {
         "changed_fields": sorted(changed),
         "before": {k: before.get(k) for k in changed},
         "after": {k: after.get(k) for k in changed},
