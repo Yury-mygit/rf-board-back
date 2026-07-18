@@ -68,6 +68,5 @@ async def board_events(
         headers={
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
         },
     )
