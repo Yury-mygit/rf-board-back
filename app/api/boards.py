@@ -15,6 +15,7 @@ from app.core.auth_ctx import (
 from app.core.board_pubsub import publish as bp_publish
 from app.core.database import get_db
 from app.core.exceptions import APIError
+from app.core.undo_log import classify_patch, record_action, snapshot_element
 from app.core.utils import now_ms
 from app.models.models import Board, BoardElement
 from app.schemas.board import (
@@ -267,6 +268,15 @@ async def create_element(
         deleted_at=None,
     )
     db.add(element)
+    await db.flush()  # чтобы element.id был доступен record_action до commit'а
+    await record_action(
+        db,
+        board_id=board_id,
+        executor_uuid=ctx.user_uuid,
+        kind="create",
+        target_ids=[element.id],
+        snapshot=snapshot_element(element),
+    )
     await db.commit()
     await db.refresh(element)
     bp_publish(board_id, {"type": "element_upserted", "element": _el_payload(element)})
@@ -290,22 +300,53 @@ async def patch_element(
         updated_at = data.pop("updated_at")
         if "parent_id" in data and data["parent_id"] is not None:
             await _validate_parent(db, board_id, element_id, data["parent_id"])
+        # BRD-18: снимок «до» для classify_patch (delta для undo).
+        before = snapshot_element(element)
         # cascade-move для frame: запоминаем старые координаты
         old_x, old_y = element.x, element.y
         for key, value in data.items():
             setattr(element, key, value)
         element.updated_at = updated_at
         cascade_dx = cascade_dy = 0.0
+        cascade_children_before: list[dict] = []
         if element.type == "frame":
             cascade_dx = element.x - old_x
             cascade_dy = element.y - old_y
             if cascade_dx or cascade_dy:
+                # BRD-18: перед cascade фиксируем before-координаты children'ов
+                # в delta, чтобы undo восстановил их без per-child SQL.
+                pre_children = (
+                    await db.execute(
+                        select(BoardElement).where(
+                            BoardElement.board_id == board_id,
+                            BoardElement.parent_id == element_id,
+                            BoardElement.deleted_at.is_(None),
+                        )
+                    )
+                ).scalars().all()
+                for c in pre_children:
+                    cascade_children_before.append({"id": str(c.id), "x": c.x, "y": c.y})
                 # БД-cascade: чтобы reload показывал согласованное состояние.
                 # Events для children НЕ публикуем — фронт сам translate'нет
                 # всех потомков локально (одна синхронная анимация).
                 await _move_children(
                     db, board_id, element_id, cascade_dx, cascade_dy, updated_at,
                 )
+        after = snapshot_element(element)
+        kind, delta = classify_patch(before, after)
+        # BRD-18: cascade info в delta для frame-move, чтобы undo восстановил
+        # children позиции (они в БД смещены, но не логированы отдельно).
+        if cascade_children_before:
+            delta["cascade_children"] = cascade_children_before
+        await record_action(
+            db,
+            board_id=board_id,
+            executor_uuid=ctx.user_uuid,
+            kind=kind,
+            target_ids=[element.id],
+            delta=delta,
+            ts_ms=updated_at,
+        )
         await db.commit()
         await db.refresh(element)
         payload = _el_payload(element)
@@ -330,8 +371,30 @@ async def delete_element(
     if not element or element.board_id != board_id:
         raise APIError(404, "element_not_found", f"Element with id '{element_id}' does not exist")
     ts = now_ms()
+    # BRD-18: snapshot для undo delete. Для frame — включаем children.
+    snap = snapshot_element(element)
+    if element.type == "frame":
+        children = (
+            await db.execute(
+                select(BoardElement).where(
+                    BoardElement.board_id == board_id,
+                    BoardElement.parent_id == element_id,
+                    BoardElement.deleted_at.is_(None),
+                )
+            )
+        ).scalars().all()
+        snap["children"] = [snapshot_element(c) for c in children]
     element.deleted_at = ts
     element.updated_at = ts
+    await record_action(
+        db,
+        board_id=board_id,
+        executor_uuid=ctx.user_uuid,
+        kind="delete",
+        target_ids=[element.id],
+        snapshot=snap,
+        ts_ms=ts,
+    )
     await db.commit()
 
 
@@ -368,6 +431,8 @@ async def upsert_element_by_ref(
         # UPDATE: id не меняем (PK + потенциальные FK). z_index сохраняем.
         if body.parent_id is not None:
             await _validate_parent(db, board_id, existing.id, body.parent_id)
+        # BRD-18: снимок «до» для classify_patch.
+        before = snapshot_element(existing)
         # cascade-move для frame: запоминаем старые координаты
         old_x, old_y = existing.x, existing.y
         existing.type = body.type
@@ -379,13 +444,38 @@ async def upsert_element_by_ref(
         existing.attrs = body.attrs
         existing.updated_at = body.updated_at
         cascade_dx = cascade_dy = 0.0
+        cascade_children_before: list[dict] = []
         if existing.type == "frame":
             cascade_dx = body.x - old_x
             cascade_dy = body.y - old_y
             if cascade_dx or cascade_dy:
+                pre_children = (
+                    await db.execute(
+                        select(BoardElement).where(
+                            BoardElement.board_id == board_id,
+                            BoardElement.parent_id == existing.id,
+                            BoardElement.deleted_at.is_(None),
+                        )
+                    )
+                ).scalars().all()
+                for c in pre_children:
+                    cascade_children_before.append({"id": str(c.id), "x": c.x, "y": c.y})
                 await _move_children(
                     db, board_id, existing.id, cascade_dx, cascade_dy, body.updated_at,
                 )
+        after = snapshot_element(existing)
+        kind, delta = classify_patch(before, after)
+        if cascade_children_before:
+            delta["cascade_children"] = cascade_children_before
+        await record_action(
+            db,
+            board_id=board_id,
+            executor_uuid=ctx.user_uuid,
+            kind=kind,
+            target_ids=[existing.id],
+            delta=delta,
+            ts_ms=body.updated_at,
+        )
         await db.commit()
         await db.refresh(existing)
         payload = _el_payload(existing)
@@ -427,6 +517,16 @@ async def upsert_element_by_ref(
         deleted_at=None,
     )
     db.add(element)
+    await db.flush()
+    await record_action(
+        db,
+        board_id=board_id,
+        executor_uuid=ctx.user_uuid,
+        kind="create",
+        target_ids=[element.id],
+        snapshot=snapshot_element(element),
+        ts_ms=body.updated_at,
+    )
     await db.commit()
     await db.refresh(element)
     bp_publish(board_id, {"type": "element_upserted", "element": _el_payload(element)})
@@ -489,8 +589,30 @@ async def delete_element_by_ref(
             f"Element with external_ref '{external_ref}' does not exist in board '{board_id}'",
         )
     ts = now_ms()
+    # BRD-18: snapshot для undo delete (включая cascade children для frame).
+    snap = snapshot_element(element)
+    if element.type == "frame":
+        children = (
+            await db.execute(
+                select(BoardElement).where(
+                    BoardElement.board_id == board_id,
+                    BoardElement.parent_id == element.id,
+                    BoardElement.deleted_at.is_(None),
+                )
+            )
+        ).scalars().all()
+        snap["children"] = [snapshot_element(c) for c in children]
     element.deleted_at = ts
     element.updated_at = ts
+    await record_action(
+        db,
+        board_id=board_id,
+        executor_uuid=ctx.user_uuid,
+        kind="delete",
+        target_ids=[element.id],
+        snapshot=snap,
+        ts_ms=ts,
+    )
     await db.commit()
     bp_publish(board_id, {
         "type": "element_deleted",

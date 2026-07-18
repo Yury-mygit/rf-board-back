@@ -13,6 +13,7 @@ from sqlalchemy import (
     Text,
     Uuid,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -69,6 +70,10 @@ class BoardElement(Base):
     w: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     h: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     attrs: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # BRD-18 (γ2): множество user_uuid как строки, кто прикасался к элементу.
+    # Пополняется в record_action(); используется для вычисления
+    # `associated_users` при логе следующего action'а над этим элементом.
+    touchers: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -136,3 +141,46 @@ class BoardGrant(Base):
     granted_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     board: Mapped["Board"] = relationship("Board", back_populates="grants")
+
+
+class BoardAction(Base):
+    """BRD-18 (γ2): event-sourced лог действий для undo/redo.
+
+    Каждая mutation в board (create/patch/delete) вызывает record_action(),
+    который пишет row сюда + пополняет touchers у target'ов. Undo/Redo в
+    BRD-19 читает stack по (board_id, user_uuid ∈ associated_users, NOT
+    pruned) ORDER BY ts_ms DESC.
+    """
+
+    __tablename__ = "board_actions"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True)
+    board_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(),
+        ForeignKey("boards.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Кто нажал — для описания «B удалил объект».
+    executor_uuid: Mapped[uuid.UUID] = mapped_column(Uuid(), nullable=False)
+    # union(executor, ∀ target: element.touchers на момент action'а).
+    # Определяет, в чей стек попадает эта запись.
+    associated_users: Mapped[list] = mapped_column(JSONB, nullable=False)
+    # create / delete / move / resize / attrs / parent / z_order / composite.
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    # element_id как строки (JSONB array). Singleton для non-composite.
+    target_ids: Mapped[list] = mapped_column(JSONB, nullable=False)
+    # Дельта для реверса: {dx, dy} для move, {key: {before, after}} для
+    # attrs, {before, after} для parent/z_order, {} для create/delete.
+    delta: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # Полный snapshot для create/delete (нужен чтобы восстановить элемент).
+    # NULL для delta-actions (move/attrs/parent/z_order).
+    # `none_as_null=True`: Python None → SQL NULL (иначе SQLAlchemy пишет
+    # JSONB `null` literal и `WHERE snapshot IS NULL` даёт false negative).
+    snapshot: Mapped[dict | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # BRD-19: true после undo. Redo сбрасывает в false.
+    undone: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # BRD-19: soft-delete при выталкивании из cap N=100.
+    pruned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
