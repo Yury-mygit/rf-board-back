@@ -27,7 +27,6 @@ from app.schemas.board import (
     BoardCreate,
     BoardElementBatchItem,
     BoardElementCreate,
-    BoardElementPatch,
     BoardElementResponse,
     BoardElementsBatchRequest,
     BoardElementsBatchResponse,
@@ -294,130 +293,9 @@ async def create_element(
     return element
 
 
-@router.patch("/{board_id}/elements/{element_id}", response_model=BoardElementResponse)
-async def patch_element(
-    board_id: UUID,
-    element_id: UUID,
-    body: BoardElementPatch,
-    db: AsyncSession = Depends(get_db),
-    ctx: AuthCtx = Depends(current_user),
-) -> BoardElement:
-    await require_board(db, ctx, board_id, "write")
-    element = await db.get(BoardElement, element_id)
-    if not element or element.deleted_at is not None or element.board_id != board_id:
-        raise APIError(404, "element_not_found", f"Element with id '{element_id}' does not exist")
-    if body.updated_at >= element.updated_at:
-        data = body.model_dump(exclude_unset=True)
-        updated_at = data.pop("updated_at")
-        if "parent_id" in data and data["parent_id"] is not None:
-            await _validate_parent(db, board_id, element_id, data["parent_id"])
-        # BRD-18: снимок «до» для classify_patch (delta для undo).
-        before = snapshot_element(element)
-        # cascade-move для frame: запоминаем старые координаты
-        old_x, old_y = element.x, element.y
-        for key, value in data.items():
-            setattr(element, key, value)
-        element.updated_at = updated_at
-        cascade_dx = cascade_dy = 0.0
-        cascade_children_before: list[dict] = []
-        if element.type == "frame":
-            cascade_dx = element.x - old_x
-            cascade_dy = element.y - old_y
-            if cascade_dx or cascade_dy:
-                # BRD-18: перед cascade фиксируем before-координаты children'ов
-                # в delta, чтобы undo восстановил их без per-child SQL.
-                pre_children = (
-                    await db.execute(
-                        select(BoardElement).where(
-                            BoardElement.board_id == board_id,
-                            BoardElement.parent_id == element_id,
-                            BoardElement.deleted_at.is_(None),
-                        )
-                    )
-                ).scalars().all()
-                for c in pre_children:
-                    cascade_children_before.append({"id": str(c.id), "x": c.x, "y": c.y})
-                # БД-cascade: чтобы reload показывал согласованное состояние.
-                # Events для children НЕ публикуем — фронт сам translate'нет
-                # всех потомков локально (одна синхронная анимация).
-                await _move_children(
-                    db, board_id, element_id, cascade_dx, cascade_dy, updated_at,
-                )
-        after = snapshot_element(element)
-        kind, delta = classify_patch(before, after)
-        # BRD-18: cascade info в delta для frame-move, чтобы undo восстановил
-        # children позиции (они в БД смещены, но не логированы отдельно).
-        if cascade_children_before:
-            delta["cascade_children"] = cascade_children_before
-        action = await record_action(
-            db,
-            board_id=board_id,
-            executor_uuid=ctx.user_uuid,
-            kind=kind,
-            target_ids=[element.id],
-            delta=delta,
-            ts_ms=updated_at,
-        )
-        associated = list(action.associated_users) if action else []
-        await db.commit()
-        await db.refresh(element)
-        payload = _el_payload(element)
-        if cascade_dx or cascade_dy:
-            payload["cascade_dx"] = cascade_dx
-            payload["cascade_dy"] = cascade_dy
-        event = {"type": "element_patched", "element": payload}
-        await attach_undo_state(db, board_id=board_id, event=event, associated_users=associated)
-        bp_publish(board_id, event)
-    return element
-
-
-@router.delete(
-    "/{board_id}/elements/{element_id}", status_code=status.HTTP_204_NO_CONTENT
-)
-async def delete_element(
-    board_id: UUID,
-    element_id: UUID,
-    db: AsyncSession = Depends(get_db),
-    ctx: AuthCtx = Depends(current_user),
-) -> None:
-    await require_board(db, ctx, board_id, "write")
-    element = await db.get(BoardElement, element_id)
-    if not element or element.board_id != board_id:
-        raise APIError(404, "element_not_found", f"Element with id '{element_id}' does not exist")
-    ts = now_ms()
-    # BRD-18: snapshot для undo delete. Для frame — включаем children.
-    snap = snapshot_element(element)
-    if element.type == "frame":
-        children = (
-            await db.execute(
-                select(BoardElement).where(
-                    BoardElement.board_id == board_id,
-                    BoardElement.parent_id == element_id,
-                    BoardElement.deleted_at.is_(None),
-                )
-            )
-        ).scalars().all()
-        snap["children"] = [snapshot_element(c) for c in children]
-    element.deleted_at = ts
-    element.updated_at = ts
-    action = await record_action(
-        db,
-        board_id=board_id,
-        executor_uuid=ctx.user_uuid,
-        kind="delete",
-        target_ids=[element.id],
-        snapshot=snap,
-        ts_ms=ts,
-    )
-    associated = list(action.associated_users) if action else []
-    await db.commit()
-    event = {
-        "type": "element_deleted",
-        "element_id": str(element.id),
-        "ts": ts,
-    }
-    await attach_undo_state(db, board_id=board_id, event=event, associated_users=associated)
-    bp_publish(board_id, event)
+# BRD-24 Stage 7: legacy single `PATCH /elements/{id}` + `DELETE /elements/{id}`
+# удалены. Frontend api.patchElement/deleteElement теперь ходят через
+# `POST /elements/batch` c items=[one]. Единая точка входа для всех mutations.
 
 
 # ── Batch mutations (BRD-24) ──────────────────────────────────────────────

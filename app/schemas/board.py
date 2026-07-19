@@ -48,17 +48,6 @@ class BoardElementCreate(CamelModel):
     updated_at: int
 
 
-class BoardElementPatch(CamelModel):
-    x: float | None = None
-    y: float | None = None
-    w: float | None = None
-    h: float | None = None
-    z_index: int | None = None
-    attrs: dict | None = None
-    parent_id: UUID | None = None
-    updated_at: int
-
-
 class BoardElementResponse(CamelModel):
     id: UUID
     board_id: UUID
