@@ -17,6 +17,24 @@ dependencies = [
     "fastmcp>=2.0.0",
 ]
 
+[project.optional-dependencies]
+# BRD-24 / REG-2: test harness. Pilot для платформы — реф. установки
+# pytest + async fixtures. Живёт как optional-dep чтобы prod-image мог
+# ставить без dev-deps (`pip install -e '.[test]'`).
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Session-scoped event loop — иначе global AsyncSessionLocal engine's
+# connection pool "переезжает" между loops и получаем InterfaceError
+# 'another operation in progress' на 2-м+ тесте.
+asyncio_default_test_loop_scope = "session"
+asyncio_default_fixture_loop_scope = "session"
+testpaths = ["tests"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

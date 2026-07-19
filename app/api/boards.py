@@ -623,11 +623,20 @@ async def batch_elements(
             continue
 
         item_kind = _classify_item_kind(before_diff, after_diff)
+        # Per-kind flat нормализация — _apply_item ожидает snap-формат
+        # соответствующий kind'у (attrs → per-key; move/resize → плоские
+        # x/y/w/h; parent → {parent_id: ...}; z_order → {z_index: ...}).
+        if item_kind == "attrs":
+            item_before = before_diff.get("attrs") or {}
+            item_after = after_diff.get("attrs") or {}
+        else:
+            item_before = before_diff
+            item_after = after_diff
         item_entry: dict = {
             "target_id": str(el.id),
             "kind": item_kind,
-            "before": before_diff,
-            "after": after_diff,
+            "before": item_before,
+            "after": item_after,
         }
         if cascade_children_snap:
             item_entry["cascade_children"] = cascade_children_snap

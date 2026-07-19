@@ -11,10 +11,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY pyproject.toml ./
 COPY app ./app
-RUN pip install --no-cache-dir .
+# BRD-24 / REG-2: test-deps (pytest+asyncio) ставим вместе с runtime — dev
+# image, prod-инстанса пока нет; акт как pilot test-harness для платформы.
+RUN pip install --no-cache-dir '.[test]'
 
 COPY alembic.ini ./
 COPY alembic ./alembic
+COPY tests ./tests
 
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
