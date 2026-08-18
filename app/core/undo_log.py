@@ -196,42 +196,42 @@ async def record_action(
     db.add(action)
     await db.flush()  # чтобы pruning-запрос увидел новый row в этой tx.
 
-    # BRD-19: cap N=100 per user. При превышении — mark самого старого
-    # non-pruned как pruned. Инвариант: до этой mutation'а stack каждого
-    # user'а ≤ cap; новый action может поднять его до cap+1, значит
-    # достаточно одного prune-hit per associated_user.
-    for u in associated:
-        stack_size = (
-            await db.execute(
-                select(func.count(BoardAction.id)).where(
-                    BoardAction.board_id == board_id,
-                    BoardAction.pruned.is_(False),
-                    BoardAction.associated_users.op("@>")(
-                        func.jsonb_build_array(text(f"'{u}'::text"))
-                    ),
-                )
+    # BRD-19: cap N=100 per user. BRD-32 fix: применяется к OWN stack
+    # (executor_uuid), не к associated_users. Раньше filter по
+    # associated_users приводил к тому, что action от user Y с ts_ms
+    # меньше seed-actions от user X мог быть prune-ннут при overflow
+    # X's stack (см. history 2026-08-18-brd32). Actor — только тот,
+    # кто вызвал record_action; own-stack растёт только за счёт своих
+    # actions. Associated users видят action через touchers для undo
+    # γ2, но их каппинг это не касается.
+    own_uuid = str(executor_uuid)
+    stack_size = (
+        await db.execute(
+            select(func.count(BoardAction.id)).where(
+                BoardAction.board_id == board_id,
+                BoardAction.executor_uuid == executor_uuid,
+                BoardAction.pruned.is_(False),
             )
-        ).scalar_one()
-        if stack_size > UNDO_STACK_CAP:
-            oldest_id = (
-                await db.execute(
-                    select(BoardAction.id).where(
-                        BoardAction.board_id == board_id,
-                        BoardAction.pruned.is_(False),
-                        BoardAction.associated_users.op("@>")(
-                            func.jsonb_build_array(text(f"'{u}'::text"))
-                        ),
-                    )
-                    .order_by(BoardAction.ts_ms.asc())
-                    .limit(1)
+        )
+    ).scalar_one()
+    if stack_size > UNDO_STACK_CAP:
+        oldest_id = (
+            await db.execute(
+                select(BoardAction.id).where(
+                    BoardAction.board_id == board_id,
+                    BoardAction.executor_uuid == executor_uuid,
+                    BoardAction.pruned.is_(False),
                 )
-            ).scalar_one_or_none()
-            if oldest_id is not None:
-                await db.execute(
-                    update(BoardAction)
-                    .where(BoardAction.id == oldest_id)
-                    .values(pruned=True)
-                )
+                .order_by(BoardAction.ts_ms.asc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if oldest_id is not None:
+            await db.execute(
+                update(BoardAction)
+                .where(BoardAction.id == oldest_id)
+                .values(pruned=True)
+            )
 
     return action
 
