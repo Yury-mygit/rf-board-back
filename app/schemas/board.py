@@ -121,19 +121,31 @@ class BoardElementsBatchResponse(CamelModel):
 
 
 class BoardElementZOrderRequest(CamelModel):
-    """BRD-6: z-order op с опциональным multi-select (element_ids).
+    """BRD-6/30: z-order op с опциональным multi-select (element_ids).
 
     URL содержит `{element_id}` — primary/anchor. Если `element_ids`
     задан, он полностью заменяет target set (URL id используется только
     для routing + permission-scope). Иначе target = [{url element_id}].
+
+    BRD-30 op="between":
+    - `before_id` — target(s) кладутся ПОД этим (rank < before_id.z_rank).
+    - `after_id` — target(s) кладутся НАД этим (rank > after_id.z_rank).
+    - Хотя бы один из двух обязателен (иначе 400).
+    - `cascade_frame` — default True; для UI-drag frame'а несёт children.
+      API-consumers могут послать False (только сам frame).
     """
-    op: Literal["front", "back", "forward", "backward"]
+    op: Literal["front", "back", "forward", "backward", "between"]
     element_ids: list[UUID] | None = None
+    before_id: UUID | None = None
+    after_id: UUID | None = None
+    cascade_frame: bool = True
 
 
 class BoardElementZOrderItem(CamelModel):
     id: UUID
     z_index: int
+    z_rank: str
+    warning: str | None = None
 
 
 class BoardElementZOrderResponse(CamelModel):

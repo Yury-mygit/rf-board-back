@@ -15,6 +15,7 @@ from app.core.auth_ctx import (
 from app.core.board_pubsub import publish as bp_publish
 from app.core.database import get_db
 from app.core.exceptions import APIError
+from app.core.lexorank import rank_after, rank_before, rank_between
 from app.core.undo_log import (
     attach_undo_state,
     classify_patch,
@@ -79,6 +80,7 @@ def _el_payload(el: BoardElement) -> dict:
         "external_ref": str(el.external_ref) if el.external_ref else None,
         "parent_id": str(el.parent_id) if el.parent_id else None,
         "z_index": el.z_index,
+        "z_rank": el.z_rank,
         "x": el.x, "y": el.y, "w": el.w, "h": el.h,
         "attrs": el.attrs or {},
         "created_at": el.created_at, "updated_at": el.updated_at,
@@ -162,7 +164,7 @@ async def get_board(
     q = (
         select(BoardElement)
         .where(BoardElement.board_id == board_id, BoardElement.deleted_at.is_(None))
-        .order_by(BoardElement.z_index.asc())
+        .order_by(BoardElement.z_rank.asc(), BoardElement.id.asc())
     )
     elements = (await db.execute(q)).scalars().all()
     caps = await your_capabilities_map(db, ctx, [board])
@@ -271,10 +273,19 @@ async def create_element(
         )
     ).scalar()
     next_z = (max_z + 1) if max_z is not None else 0
+    # BRD-30 D10: z_rank выставляется в rank_after(max) — новый элемент
+    # становится самым верхним, соответствует поведению z_index.
+    max_rank = (
+        await db.execute(
+            select(func.max(BoardElement.z_rank)).where(BoardElement.board_id == board_id)
+        )
+    ).scalar()
+    next_rank = rank_after(max_rank) if max_rank else "V"
     element = BoardElement(
         **body.model_dump(),
         board_id=board_id,
         z_index=next_z,
+        z_rank=next_rank,
         deleted_at=None,
     )
     db.add(element)
@@ -312,6 +323,7 @@ def _item_snapshot(el: BoardElement) -> dict:
     return {
         "x": el.x, "y": el.y, "w": el.w, "h": el.h,
         "z_index": el.z_index,
+        "z_rank": el.z_rank,
         "parent_id": str(el.parent_id) if el.parent_id else None,
         "attrs": dict(el.attrs or {}),
     }
@@ -321,7 +333,7 @@ def _diff_snapshots(before: dict, after: dict) -> tuple[dict, dict]:
     """Возвращает (before_diff, after_diff) — только изменившиеся ключи."""
     b_diff: dict = {}
     a_diff: dict = {}
-    for k in ("x", "y", "w", "h", "z_index", "parent_id"):
+    for k in ("x", "y", "w", "h", "z_index", "z_rank", "parent_id"):
         if before.get(k) != after.get(k):
             b_diff[k] = before.get(k)
             a_diff[k] = after.get(k)
@@ -588,6 +600,174 @@ def _collect_frame_descendants(
                 _collect_frame_descendants(all_elements, el.id, out)
 
 
+async def _z_order_between(
+    db: AsyncSession,
+    ctx: AuthCtx,
+    board_id: UUID,
+    element_id: UUID,
+    body: BoardElementZOrderRequest,
+) -> BoardElementZOrderResponse:
+    """BRD-30: op="between" — вставка target(s) в z_rank слот между
+    before_id/after_id элементами.
+
+    Semantic:
+    - before_id — target(s) кладутся ПОД (rank < before.z_rank).
+    - after_id  — target(s) кладутся НАД (rank > after.z_rank).
+    - Оба заданы → strictly between.
+    - Один из двух обязателен, иначе 400.
+
+    Multi-select: N target'ы вставляются как соседний блок с midpoint-ranks
+    в интервале (after.z_rank, before.z_rank), сохраняя их взаимный порядок
+    (по текущему z_rank).
+
+    Cascade frame: если target = frame и cascade_frame=True (default),
+    children (по parent_id, recursive) вставляются сразу после frame'а
+    в том же интервале, сохраняя их взаимный порядок.
+    """
+    if body.before_id is None and body.after_id is None:
+        raise APIError(
+            400, "invalid_z_order_target",
+            "op=between requires beforeId and/or afterId",
+        )
+
+    # Fetch anchors.
+    anchor_ids = [i for i in (body.before_id, body.after_id) if i is not None]
+    anchors = (
+        await db.execute(
+            select(BoardElement).where(
+                BoardElement.board_id == board_id,
+                BoardElement.id.in_(anchor_ids),
+                BoardElement.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    anchors_by_id = {a.id: a for a in anchors}
+    for anchor_id in anchor_ids:
+        if anchor_id not in anchors_by_id:
+            raise APIError(
+                400, "invalid_z_order_target",
+                f"Anchor element {anchor_id} not on board {board_id}",
+            )
+    before_el = anchors_by_id.get(body.before_id) if body.before_id else None
+    after_el = anchors_by_id.get(body.after_id) if body.after_id else None
+    before_rank = before_el.z_rank if before_el else None
+    after_rank = after_el.z_rank if after_el else None
+    # Direction check.
+    if before_rank and after_rank and after_rank >= before_rank:
+        raise APIError(
+            400, "invalid_z_order_target",
+            f"afterId.z_rank ({after_rank}) must be < beforeId.z_rank "
+            f"({before_rank}) — направление перепутано",
+        )
+
+    # Determine target set. element_ids overrides URL element_id.
+    primary_ids: list[UUID] = (
+        list(body.element_ids) if body.element_ids else [element_id]
+    )
+    all_elements = (
+        await db.execute(
+            select(BoardElement).where(
+                BoardElement.board_id == board_id,
+                BoardElement.deleted_at.is_(None),
+            )
+            .order_by(BoardElement.z_rank.asc(), BoardElement.id.asc())
+        )
+    ).scalars().all()
+    by_id = {el.id: el for el in all_elements}
+
+    for pid in primary_ids:
+        if pid not in by_id:
+            raise APIError(
+                400, "invalid_z_order_target",
+                f"Element {pid} not on board {board_id}",
+            )
+
+    # Cascade: if primary is frame and cascade_frame=True → add descendants.
+    effective_ids: list[UUID] = list(primary_ids)  # ordered
+    if body.cascade_frame:
+        for pid in primary_ids:
+            if by_id[pid].type == "frame":
+                desc: set[UUID] = set()
+                _collect_frame_descendants(all_elements, pid, desc)
+                # Sort descendants by current z_rank ascending.
+                desc_sorted = sorted(desc, key=lambda i: by_id[i].z_rank)
+                for d in desc_sorted:
+                    if d not in effective_ids:
+                        effective_ids.append(d)
+
+    # Sort effective (primary + cascade) by current z_rank, preserving
+    # relative order across the group.
+    effective_ids = sorted(effective_ids, key=lambda i: by_id[i].z_rank)
+
+    # Chain of ranks. Cursor moves from after_rank (или None) upward to
+    # before_rank (или None).
+    new_ranks: dict[UUID, str] = {}
+    cursor = after_rank
+    for eid in effective_ids:
+        new_rank = rank_between(cursor, before_rank)
+        new_ranks[eid] = new_rank
+        cursor = new_rank
+
+    ts = now_ms()
+    delta_items: list[dict] = []
+    payload_items: list[dict] = []
+    response_items: list[BoardElementZOrderItem] = []
+    for eid in effective_ids:
+        el = by_id[eid]
+        before_snap = _item_snapshot(el)
+        el.z_rank = new_ranks[eid]
+        el.updated_at = ts
+        after_snap = _item_snapshot(el)
+        before_diff, after_diff = _diff_snapshots(before_snap, after_snap)
+        if not after_diff:
+            continue  # no-op skip
+        delta_items.append({
+            "target_id": str(eid),
+            "kind": "mixed",  # BRD-29 composite handler support
+            "before": before_diff,
+            "after": after_diff,
+        })
+        payload_items.append({"element": _el_payload(el)})
+        # Cross-parent warning.
+        warning = None
+        anchor_parents = {a.parent_id for a in anchors}
+        if any(el.parent_id != ap for ap in anchor_parents):
+            warning = "cross_parent"
+        response_items.append(BoardElementZOrderItem(
+            id=eid, z_index=el.z_index, z_rank=el.z_rank, warning=warning,
+        ))
+
+    if not delta_items:
+        return BoardElementZOrderResponse(items=response_items)
+
+    action = await record_action(
+        db,
+        board_id=board_id,
+        executor_uuid=ctx.user_uuid,
+        kind="composite",
+        target_ids=[UUID(i["target_id"]) for i in delta_items],
+        delta={"items": delta_items},
+        ts_ms=ts,
+    )
+    associated_all = set(action.associated_users) if action else set()
+
+    await db.commit()
+
+    event = {
+        "type": "elements_batch_patched",
+        "items": payload_items,
+        "actor_uuid": str(ctx.user_uuid),
+        "ts": ts,
+    }
+    await attach_undo_state(
+        db, board_id=board_id, event=event,
+        associated_users=list(associated_all),
+    )
+    bp_publish(board_id, event)
+
+    return BoardElementZOrderResponse(items=response_items)
+
+
 @router.post(
     "/{board_id}/elements/{element_id}/z-order",
     response_model=BoardElementZOrderResponse,
@@ -616,6 +796,12 @@ async def z_order_element(
             key=str(board_id)
         )
     )
+
+    # BRD-30: op="between" — отдельный path (z_rank driven, не z_index).
+    if body.op == "between":
+        return await _z_order_between(
+            db, ctx, board_id, element_id, body,
+        )
 
     primary_ids: set[UUID] = set(body.element_ids) if body.element_ids else {element_id}
 
@@ -710,11 +896,66 @@ async def z_order_element(
     if not changes:
         # No-op: ни UPDATE, ни record_action, ни SSE.
         return BoardElementZOrderResponse(items=[
-            BoardElementZOrderItem(id=pid, z_index=by_id[pid].z_index)
+            BoardElementZOrderItem(
+                id=pid, z_index=by_id[pid].z_index, z_rank=by_id[pid].z_rank,
+            )
             for pid in primary_ids
         ])
 
     ts = now_ms()
+    # BRD-30 D10: legacy op обновляет z_rank точечно — сохраняем плотность,
+    # которую могли создать between-op inserts.
+    non_affected_ids = {el.id for el in all_elements if el.id not in changes}
+
+    if op == "front":
+        max_rank = max(
+            (by_id[i].z_rank for i in non_affected_ids), default=None,
+        )
+        # affected sorted by NEW z_index — задаём rank цепочкой вверх.
+        cursor_rank = max_rank
+        for eid in sorted(changes.keys(), key=lambda i: changes[i][1]):
+            cursor_rank = rank_after(cursor_rank) if cursor_rank else "V"
+            by_id[eid].z_rank = cursor_rank
+    elif op == "back":
+        min_rank = min(
+            (by_id[i].z_rank for i in non_affected_ids), default=None,
+        )
+        cursor_rank = min_rank
+        # affected sorted DESC by new z_index — задаём rank цепочкой вниз.
+        for eid in sorted(changes.keys(), key=lambda i: -changes[i][1]):
+            if cursor_rank:
+                cursor_rank = rank_before(cursor_rank)
+            else:
+                cursor_rank = "V"
+            by_id[eid].z_rank = cursor_rank
+    elif op in ("forward", "backward"):
+        # forward/backward — swap z_index парами. Swap partner'ы = elements,
+        # у которых z_index стал прежним значением affected'а. Идентифицируем
+        # по (before_z, after_z) для affected и симметрично для non-affected.
+        # Проще: для каждого changed non-affected — swap его z_rank с
+        # соответствующим affected.
+        swap_pairs: list[tuple[UUID, UUID]] = []
+        affected_changes = [
+            (eid, before_z, after_z)
+            for eid, (before_z, after_z) in changes.items()
+            if eid not in non_affected_ids  # sanity — они все не в non_affected по определению
+        ]
+        # non-affected changed = те же еиds что-то поменяли (swap partner'ы).
+        # В нашем алгоритме для forward/backward пары точно есть.
+        for eid, before_z, after_z in affected_changes:
+            partner = next(
+                (
+                    other_eid for other_eid, (ob, oa) in changes.items()
+                    if other_eid != eid and ob == after_z and oa == before_z
+                ),
+                None,
+            )
+            if partner is not None and (partner, eid) not in swap_pairs:
+                swap_pairs.append((eid, partner))
+        for a_id, b_id in swap_pairs:
+            by_id[a_id].z_rank, by_id[b_id].z_rank = (
+                by_id[b_id].z_rank, by_id[a_id].z_rank,
+            )
     for eid, (_before, after) in changes.items():
         el = by_id[eid]
         el.z_index = after
@@ -773,7 +1014,9 @@ async def z_order_element(
     # Response — все изменённые (не только primary): фронтенду проще применить
     # все обновления одним loop'ом.
     return BoardElementZOrderResponse(items=[
-        BoardElementZOrderItem(id=eid, z_index=after)
+        BoardElementZOrderItem(
+            id=eid, z_index=after, z_rank=by_id[eid].z_rank,
+        )
         for eid, (_before, after) in changes.items()
     ])
 

@@ -65,6 +65,9 @@ class BoardElement(Base):
         Uuid(), ForeignKey("board_elements.id"), nullable=True, index=True
     )
     z_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # BRD-30: LEXORANK string, sortable base62 (`0-9A-Za-z`). Ведущий ключ
+    # sort'а после миграции. `z_index` остаётся для API backward compat.
+    z_rank: Mapped[str] = mapped_column(String(64), nullable=False, default="V")
     x: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     y: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     w: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
