@@ -195,14 +195,17 @@ async def test_between_frame_alone_does_not_move_children(
 
 # ─── Between: cross-parent warning ──────────────────────────────────
 
-async def test_between_cross_parent_warning(
+async def test_between_cross_parent_auto_reparents(
     client, fake_headers, test_board, make_element, db,
 ):
-    """Target parent_id != beforeId/afterId parent_id → warning."""
+    """BRD-36: target с parent_id != anchor's → auto-reparent.
+    Backend меняет parent_id на anchor's, включает в composite delta
+    для undo восстановления."""
     frame = await make_element(test_board, type_="frame", w=400.0, h=300.0)
     child_a = await make_element(test_board, parent_id=frame)
     child_b = await make_element(test_board, parent_id=frame)
     outsider = await make_element(test_board)  # parent_id=None
+    outsider_parent_before = (await _fresh(db, outsider)).parent_id
 
     r = await client.post(
         f"/boards/{test_board}/elements/{outsider}/z-order",
@@ -211,11 +214,26 @@ async def test_between_cross_parent_warning(
               "beforeId": str(child_b)},
     )
     assert r.status_code == 200, r.text
-    item = next(x for x in r.json()["items"] if x["id"] == str(outsider))
-    assert item.get("warning") == "cross_parent"
+
+    # Outsider теперь child of frame (auto-reparented).
+    outsider_el = await _fresh(db, outsider)
+    assert outsider_el.parent_id == frame, (
+        f"BRD-36 auto-reparent не сработал: parent_id={outsider_el.parent_id}"
+    )
+    assert outsider_parent_before is None
+    # Z_rank между child_a и child_b.
+    a_r = (await _fresh(db, child_a)).z_rank
+    b_r = (await _fresh(db, child_b)).z_rank
+    assert a_r < outsider_el.z_rank < b_r
+
+    # Undo восстанавливает и parent_id, и z_rank.
+    r = await client.post(f"/boards/{test_board}/undo", headers=fake_headers)
+    assert r.status_code == 200
+    outsider_el = await _fresh(db, outsider)
+    assert outsider_el.parent_id is None
 
 
-async def test_between_same_parent_no_warning(
+async def test_between_same_parent_no_reparent(
     client, fake_headers, test_board, make_element, db,
 ):
     frame = await make_element(test_board, type_="frame", w=400.0, h=300.0)
@@ -230,8 +248,9 @@ async def test_between_same_parent_no_warning(
               "beforeId": str(child_b)},
     )
     assert r.status_code == 200, r.text
-    item = next(x for x in r.json()["items"] if x["id"] == str(child_c))
-    assert item.get("warning") is None
+    # No parent change (already same parent).
+    child_c_el = await _fresh(db, child_c)
+    assert child_c_el.parent_id == frame
 
 
 # ─── Between: validation errors ─────────────────────────────────────

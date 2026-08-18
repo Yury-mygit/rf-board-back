@@ -146,7 +146,8 @@ class BoardElementZOrderItem(CamelModel):
     id: UUID
     z_index: int
     z_rank: str
-    warning: str | None = None
+    # BRD-36: cross_parent warning убран — заменено auto-reparent (backend
+    # меняет parent_id и включает в composite delta для undo).
 
 
 class BoardElementZOrderResponse(CamelModel):

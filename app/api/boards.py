@@ -644,12 +644,16 @@ async def _z_order_between(
             )
 
     # BRD-35: backend больше НЕ выполняет hidden cascade. Caller (frontend
-    # layer panel или API) обязан включить children через `elementIds`
-    # если хочет их переставить вместе с frame'ом.
+    # layer panel или API) обязан включить children через `elementIds`.
     effective_ids: list[UUID] = sorted(primary_ids, key=lambda i: by_id[i].z_rank)
 
-    # Chain of ranks. Cursor moves from after_rank (или None) upward to
-    # before_rank (или None).
+    # BRD-36: auto-reparent. Anchor parent_id — целевой parent для target'ов.
+    # Если target parent_id ≠ anchor parent_id → auto меняем target.parent_id
+    # (delta.kind=mixed включит parent_id в diff, undo восстановит).
+    anchor_parents = {a.parent_id for a in anchors}
+    target_parent = anchors[0].parent_id if len(anchor_parents) == 1 else None
+
+    # Chain of ranks. Cursor moves from after_rank upward to before_rank.
     new_ranks: dict[UUID, str] = {}
     cursor = after_rank
     for eid in effective_ids:
@@ -665,6 +669,10 @@ async def _z_order_between(
         el = by_id[eid]
         before_snap = _item_snapshot(el)
         el.z_rank = new_ranks[eid]
+        # BRD-36: auto-reparent если anchors из одного parent'а и не
+        # совпадает с текущим target parent_id.
+        if target_parent is not None and el.parent_id != target_parent:
+            el.parent_id = target_parent
         el.updated_at = ts
         after_snap = _item_snapshot(el)
         before_diff, after_diff = _diff_snapshots(before_snap, after_snap)
@@ -677,13 +685,8 @@ async def _z_order_between(
             "after": after_diff,
         })
         payload_items.append({"element": _el_payload(el)})
-        # Cross-parent warning.
-        warning = None
-        anchor_parents = {a.parent_id for a in anchors}
-        if any(el.parent_id != ap for ap in anchor_parents):
-            warning = "cross_parent"
         response_items.append(BoardElementZOrderItem(
-            id=eid, z_index=el.z_index, z_rank=el.z_rank, warning=warning,
+            id=eid, z_index=el.z_index, z_rank=el.z_rank,
         ))
 
     if not delta_items:
@@ -780,7 +783,19 @@ async def z_order_element(
         if by_id[pid].type == "frame":
             _collect_frame_descendants(all_elements, pid, affected)
 
-    non_affected = [el for el in all_elements if el.id not in affected]
+    # BRD-36: per-parent scope. non_affected — только siblings target'а
+    # (same parent_id как у primary). Так Front/Back/Forward/Backward
+    # не выкидывают target за пределы его контейнера (rect в frame → Back
+    # → нижний слой среди siblings, но НЕ ниже frame'а самого).
+    # Primary_parent берётся у первого primary (все primary должны быть
+    # из одного parent'а на практике — multi-select — либо все top-level,
+    # либо все children одного frame'а).
+    first_primary = next(iter(primary_ids))
+    scope_parent_id = by_id[first_primary].parent_id
+    non_affected = [
+        el for el in all_elements
+        if el.id not in affected and el.parent_id == scope_parent_id
+    ]
     affected_els = [el for el in all_elements if el.id in affected]  # sorted by z ASC
     op = body.op
 
@@ -852,9 +867,13 @@ async def z_order_element(
         ])
 
     ts = now_ms()
-    # BRD-30 D10: legacy op обновляет z_rank точечно — сохраняем плотность,
-    # которую могли создать between-op inserts.
-    non_affected_ids = {el.id for el in all_elements if el.id not in changes}
+    # BRD-30 D10 + BRD-36: legacy op обновляет z_rank точечно среди
+    # siblings того же parent'а (не глобально) — сохраняем плотность
+    # между-op inserts + per-parent scope.
+    non_affected_ids = {
+        el.id for el in all_elements
+        if el.id not in changes and el.parent_id == scope_parent_id
+    }
 
     if op == "front":
         max_rank = max(
@@ -869,13 +888,22 @@ async def z_order_element(
         min_rank = min(
             (by_id[i].z_rank for i in non_affected_ids), default=None,
         )
-        cursor_rank = min_rank
+        # BRD-36: для child of frame — lower bound = frame's z_rank. Иначе
+        # child уходит визуально под frame. `rank_between(parent_rank,
+        # min_sibling)` гарантирует что child остаётся выше frame.
+        parent_rank = None
+        if scope_parent_id is not None and scope_parent_id in by_id:
+            parent_rank = by_id[scope_parent_id].z_rank
         # affected sorted DESC by new z_index — задаём rank цепочкой вниз.
+        cursor_rank = min_rank
         for eid in sorted(changes.keys(), key=lambda i: -changes[i][1]):
-            if cursor_rank:
-                cursor_rank = rank_before(cursor_rank)
-            else:
+            if cursor_rank is None:
                 cursor_rank = "V"
+            elif parent_rank is not None:
+                # Ограничить снизу: rank_between(parent_rank, cursor_rank).
+                cursor_rank = rank_between(parent_rank, cursor_rank)
+            else:
+                cursor_rank = rank_before(cursor_rank)
             by_id[eid].z_rank = cursor_rank
     elif op in ("forward", "backward"):
         # forward/backward — swap z_index парами. Swap partner'ы = elements,
