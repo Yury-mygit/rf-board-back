@@ -120,6 +120,26 @@ class BoardElementsBatchResponse(CamelModel):
     skipped: list[dict]  # [{"id": UUID, "reason": str}]
 
 
+class BoardElementZOrderRequest(CamelModel):
+    """BRD-6: z-order op с опциональным multi-select (element_ids).
+
+    URL содержит `{element_id}` — primary/anchor. Если `element_ids`
+    задан, он полностью заменяет target set (URL id используется только
+    для routing + permission-scope). Иначе target = [{url element_id}].
+    """
+    op: Literal["front", "back", "forward", "backward"]
+    element_ids: list[UUID] | None = None
+
+
+class BoardElementZOrderItem(CamelModel):
+    id: UUID
+    z_index: int
+
+
+class BoardElementZOrderResponse(CamelModel):
+    items: list[BoardElementZOrderItem]
+
+
 class BoardFull(CamelModel):
     id: UUID
     title: str

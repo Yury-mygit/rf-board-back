@@ -31,6 +31,9 @@ from app.schemas.board import (
     BoardElementsBatchRequest,
     BoardElementsBatchResponse,
     BoardElementUpsertByRef,
+    BoardElementZOrderItem,
+    BoardElementZOrderRequest,
+    BoardElementZOrderResponse,
     BoardFull,
     BoardPatch,
     BoardResponse,
@@ -564,6 +567,215 @@ async def batch_elements(
     bp_publish(board_id, event)
 
     return BoardElementsBatchResponse(applied=applied, skipped=skipped)
+
+
+# ── BRD-6: z-order (front/back/forward/backward) ─────────────────────────────
+# Server-authoritative endpoint (client не вычисляет z_index — decision D3).
+# Multi-select через body.element_ids (D8: per-element relative shift).
+# Frame cascade — расширяем target set рекурсивными children (D9).
+# Advisory lock — per-board serialization (D11).
+# No-op guard — если ничего не меняется, ни UPDATE ни record_action (D10).
+
+
+def _collect_frame_descendants(
+    all_elements: list[BoardElement], parent_id: UUID, out: set[UUID],
+) -> None:
+    """BRD-6 D9: recursive fetch descendants (по parent_id) для frame cascade."""
+    for el in all_elements:
+        if el.parent_id == parent_id and el.id not in out:
+            out.add(el.id)
+            if el.type == "frame":
+                _collect_frame_descendants(all_elements, el.id, out)
+
+
+@router.post(
+    "/{board_id}/elements/{element_id}/z-order",
+    response_model=BoardElementZOrderResponse,
+)
+async def z_order_element(
+    board_id: UUID,
+    element_id: UUID,
+    body: BoardElementZOrderRequest,
+    db: AsyncSession = Depends(get_db),
+    ctx: AuthCtx = Depends(current_user),
+) -> BoardElementZOrderResponse:
+    """BRD-6: server-authoritative z-order (front/back/forward/backward)
+    с multi-select + frame cascade + advisory lock + no-op guard.
+
+    - Single (без element_ids) → kind="z_order" в undo-log (плоский delta).
+    - Multi/cascade → kind="composite" с массивом per-item delta (см. BRD-24
+      + apply_undo/redo `_apply_item`).
+    - SSE `element_patched` для каждого затронутого элемента (D6) — DOM
+      reorder на клиенте через BRD-22 `reorderNodeByZ`.
+    """
+    await require_board(db, ctx, board_id, "write")
+
+    # BRD-6 D11: per-board advisory lock (та же техника, что batch).
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key)::bigint)").bindparams(
+            key=str(board_id)
+        )
+    )
+
+    primary_ids: set[UUID] = set(body.element_ids) if body.element_ids else {element_id}
+
+    all_elements = (
+        await db.execute(
+            select(BoardElement)
+            .where(
+                BoardElement.board_id == board_id,
+                BoardElement.deleted_at.is_(None),
+            )
+            .order_by(BoardElement.z_index.asc(), BoardElement.id.asc())
+        )
+    ).scalars().all()
+    by_id = {el.id: el for el in all_elements}
+
+    missing = [pid for pid in primary_ids if pid not in by_id]
+    if missing:
+        raise APIError(
+            400, "invalid_z_order_target",
+            f"Element(s) {[str(m) for m in missing]} not on board {board_id}",
+        )
+
+    # BRD-6 D9: cascade — расширить primary_ids всеми descendants любого
+    # primary-frame'а.
+    affected: set[UUID] = set(primary_ids)
+    for pid in list(primary_ids):
+        if by_id[pid].type == "frame":
+            _collect_frame_descendants(all_elements, pid, affected)
+
+    non_affected = [el for el in all_elements if el.id not in affected]
+    affected_els = [el for el in all_elements if el.id in affected]  # sorted by z ASC
+    op = body.op
+
+    # z_by_id — рабочая копия, обновляется алгоритмами swap'а (forward/backward).
+    z_by_id: dict[UUID, int] = {el.id: el.z_index for el in all_elements}
+
+    if op == "front":
+        max_other = max((el.z_index for el in non_affected), default=None)
+        min_affected = min(el.z_index for el in affected_els)
+        # BRD-6 D10 semantic no-op: если все affected уже выше всех non-affected,
+        # не сдвигаем — иначе compression переписывает z без семантической
+        # причины (генерирует лишний action + SSE).
+        if max_other is not None and min_affected > max_other:
+            pass
+        else:
+            base = max_other + 1 if max_other is not None else 0
+            for i, el in enumerate(affected_els):
+                z_by_id[el.id] = base + i
+    elif op == "back":
+        min_other = min((el.z_index for el in non_affected), default=None)
+        max_affected = max(el.z_index for el in affected_els)
+        if min_other is not None and max_affected < min_other:
+            pass
+        else:
+            base = min_other - len(affected_els) if min_other is not None else 0
+            for i, el in enumerate(affected_els):
+                z_by_id[el.id] = base + i
+    elif op == "forward":
+        # BRD-6 D8: per-element swap с ближайшим non-affected higher z.
+        # Iterate top-down чтобы избежать конфликтов при последовательных swap'ах.
+        for el in reversed(affected_els):
+            my_z = z_by_id[el.id]
+            candidate: BoardElement | None = None
+            candidate_z: int | None = None
+            for other in non_affected:
+                other_z = z_by_id[other.id]
+                if other_z > my_z and (candidate_z is None or other_z < candidate_z):
+                    candidate = other
+                    candidate_z = other_z
+            if candidate is not None:
+                z_by_id[el.id], z_by_id[candidate.id] = candidate_z, my_z
+    elif op == "backward":
+        for el in affected_els:
+            my_z = z_by_id[el.id]
+            candidate = None
+            candidate_z = None
+            for other in non_affected:
+                other_z = z_by_id[other.id]
+                if other_z < my_z and (candidate_z is None or other_z > candidate_z):
+                    candidate = other
+                    candidate_z = other_z
+            if candidate is not None:
+                z_by_id[el.id], z_by_id[candidate.id] = candidate_z, my_z
+
+    # Собираем реальные изменения (BRD-6 D10 no-op guard).
+    changes: dict[UUID, tuple[int, int]] = {}  # id → (before_z, after_z)
+    for el in all_elements:
+        new_z = z_by_id[el.id]
+        if new_z != el.z_index:
+            changes[el.id] = (el.z_index, new_z)
+
+    if not changes:
+        # No-op: ни UPDATE, ни record_action, ни SSE.
+        return BoardElementZOrderResponse(items=[
+            BoardElementZOrderItem(id=pid, z_index=by_id[pid].z_index)
+            for pid in primary_ids
+        ])
+
+    ts = now_ms()
+    for eid, (_before, after) in changes.items():
+        el = by_id[eid]
+        el.z_index = after
+        el.updated_at = ts
+
+    # BRD-6 D5: single → kind="z_order" flat delta; multi/cascade → composite.
+    associated_all: set[str] = set()
+    if len(changes) == 1:
+        (eid, (before_z, after_z)), = changes.items()
+        action = await record_action(
+            db,
+            board_id=board_id,
+            executor_uuid=ctx.user_uuid,
+            kind="z_order",
+            target_ids=[eid],
+            delta={"before": before_z, "after": after_z},
+            ts_ms=ts,
+        )
+    else:
+        delta_items = [
+            {
+                "target_id": str(eid),
+                "kind": "z_order",
+                "before": {"z_index": before_z},
+                "after": {"z_index": after_z},
+            }
+            for eid, (before_z, after_z) in changes.items()
+        ]
+        action = await record_action(
+            db,
+            board_id=board_id,
+            executor_uuid=ctx.user_uuid,
+            kind="composite",
+            target_ids=list(changes.keys()),
+            delta={"items": delta_items},
+            ts_ms=ts,
+        )
+    if action is not None:
+        associated_all = set(action.associated_users or [])
+
+    await db.commit()
+
+    # BRD-6 D6: per-element `element_patched` (существующий SSE contract).
+    # DOM reorder на клиенте — BRD-22 `reorderNodeByZ`.
+    for eid in changes:
+        event = {
+            "type": "element_patched",
+            "element": _el_payload(by_id[eid]),
+        }
+        await attach_undo_state(
+            db, board_id=board_id, event=event,
+            associated_users=list(associated_all),
+        )
+        bp_publish(board_id, event)
+
+    # Response — все изменённые (не только primary): фронтенду проще применить
+    # все обновления одним loop'ом.
+    return BoardElementZOrderResponse(items=[
+        BoardElementZOrderItem(id=eid, z_index=after)
+        for eid, (_before, after) in changes.items()
+    ])
 
 
 # ── Upsert / lookup / delete по external_ref ──────────────────────────────────
