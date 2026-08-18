@@ -165,21 +165,28 @@ async def test_mixed_batch_patch_and_delete_are_one_composite(
 
 # ─────────────────── Frame cascade + undo ─────────────────────────────
 
-async def test_frame_move_cascade_and_undo(
+async def test_frame_move_with_explicit_children_and_undo(
     client, fake_headers, test_board, make_element, db,
 ):
+    """BRD-35: backend больше НЕ выполняет hidden cascade. Caller
+    (frontend drag handler) обязан включить children в batch как
+    отдельные items с их новыми absolute positions."""
     frame_id = await make_element(test_board, type_="frame", x=0.0, y=0.0, w=400.0, h=300.0)
     ch1 = await make_element(test_board, x=20.0, y=30.0, parent_id=frame_id)
     ch2 = await make_element(test_board, x=50.0, y=60.0, parent_id=frame_id)
 
+    # Frontend вычисляет новые positions и посылает все items explicit.
     r = await client.post(
         f"/boards/{test_board}/elements/batch",
         headers=fake_headers,
-        json={"items": [{"id": str(frame_id), "op": "patch", "patch": {"x": 100.0, "y": 200.0}}]},
+        json={"items": [
+            {"id": str(frame_id), "op": "patch", "patch": {"x": 100.0, "y": 200.0}},
+            {"id": str(ch1), "op": "patch", "patch": {"x": 120.0, "y": 230.0}},
+            {"id": str(ch2), "op": "patch", "patch": {"x": 150.0, "y": 260.0}},
+        ]},
     )
     assert r.status_code == 200, r.text
 
-    # Children смещаются в БД.
     c1 = await db.get(BoardElement, ch1)
     c2 = await db.get(BoardElement, ch2)
     await db.refresh(c1)
@@ -187,16 +194,17 @@ async def test_frame_move_cascade_and_undo(
     assert c1.x == 120.0 and c1.y == 230.0
     assert c2.x == 150.0 and c2.y == 260.0
 
-    # Composite action содержит cascade_children snapshot для frame-item.
+    # Composite action содержит 3 отдельных item snapshots — БЕЗ
+    # cascade_children (BRD-35 удаление).
     action = (await db.execute(
         select(BoardAction).where(BoardAction.board_id == test_board)
         .order_by(BoardAction.ts_ms.desc()).limit(1)
     )).scalar_one()
-    frame_item = next(i for i in action.delta["items"] if i["target_id"] == str(frame_id))
-    assert "cascade_children" in frame_item
-    assert len(frame_item["cascade_children"]) == 2
+    assert len(action.delta["items"]) == 3
+    for item in action.delta["items"]:
+        assert "cascade_children" not in item
 
-    # Undo: frame + children обратно.
+    # Undo: frame + children все возвращаются на исходные (per-item snapshot).
     r = await client.post(f"/boards/{test_board}/undo", headers=fake_headers)
     assert r.status_code == 200
 

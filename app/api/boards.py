@@ -480,35 +480,13 @@ async def batch_elements(
         if "parent_id" in patch and patch["parent_id"] is not None:
             await _validate_parent(db, board_id, el.id, patch["parent_id"])
 
+        # BRD-35: backend больше НЕ выполняет hidden cascade для frame.
+        # Frontend (или другой caller) обязан включить children как
+        # отдельные items в batch. Backend просто applies каждый item.
         before_full = _item_snapshot(el)
-        old_x, old_y = el.x, el.y
-
         for k, v in patch.items():
             setattr(el, k, v)
         el.updated_at = ts
-
-        cascade_children_snap: list[dict] = []
-        if el.type == "frame":
-            cascade_dx = el.x - old_x
-            cascade_dy = el.y - old_y
-            if cascade_dx or cascade_dy:
-                pre_children = (
-                    await db.execute(
-                        select(BoardElement).where(
-                            BoardElement.board_id == board_id,
-                            BoardElement.parent_id == el.id,
-                            BoardElement.deleted_at.is_(None),
-                        )
-                    )
-                ).scalars().all()
-                for c in pre_children:
-                    cascade_children_snap.append({
-                        "id": str(c.id), "x": c.x, "y": c.y,
-                    })
-                await _move_children(
-                    db, board_id, el.id, cascade_dx, cascade_dy, ts,
-                )
-
         after_full = _item_snapshot(el)
         before_diff, after_diff = _diff_snapshots(before_full, after_full)
         if not after_diff:
@@ -516,36 +494,19 @@ async def batch_elements(
             continue
 
         item_kind = _classify_item_kind(before_diff, after_diff)
-        # Per-kind flat нормализация — _apply_item ожидает snap-формат
-        # соответствующий kind'у (attrs → per-key; move/resize → плоские
-        # x/y/w/h; parent → {parent_id: ...}; z_order → {z_index: ...}).
         if item_kind == "attrs":
             item_before = before_diff.get("attrs") or {}
             item_after = after_diff.get("attrs") or {}
         else:
             item_before = before_diff
             item_after = after_diff
-        item_entry: dict = {
+        delta_items.append({
             "target_id": str(el.id),
             "kind": item_kind,
             "before": item_before,
             "after": item_after,
-        }
-        if cascade_children_snap:
-            item_entry["cascade_children"] = cascade_children_snap
-        delta_items.append(item_entry)
-
-        el_payload = _el_payload(el)
-        if cascade_children_snap:
-            el_payload_dx = el.x - (before_diff.get("x") or el.x)
-            el_payload_dy = el.y - (before_diff.get("y") or el.y)
-            payload_items.append({
-                "element": el_payload,
-                "cascade_dx": el_payload_dx,
-                "cascade_dy": el_payload_dy,
-            })
-        else:
-            payload_items.append({"element": el_payload})
+        })
+        payload_items.append({"element": _el_payload(el)})
         applied.append(el.id)
 
     if not delta_items:
@@ -682,22 +643,10 @@ async def _z_order_between(
                 f"Element {pid} not on board {board_id}",
             )
 
-    # Cascade: if primary is frame and cascade_frame=True → add descendants.
-    effective_ids: list[UUID] = list(primary_ids)  # ordered
-    if body.cascade_frame:
-        for pid in primary_ids:
-            if by_id[pid].type == "frame":
-                desc: set[UUID] = set()
-                _collect_frame_descendants(all_elements, pid, desc)
-                # Sort descendants by current z_rank ascending.
-                desc_sorted = sorted(desc, key=lambda i: by_id[i].z_rank)
-                for d in desc_sorted:
-                    if d not in effective_ids:
-                        effective_ids.append(d)
-
-    # Sort effective (primary + cascade) by current z_rank, preserving
-    # relative order across the group.
-    effective_ids = sorted(effective_ids, key=lambda i: by_id[i].z_rank)
+    # BRD-35: backend больше НЕ выполняет hidden cascade. Caller (frontend
+    # layer panel или API) обязан включить children через `elementIds`
+    # если хочет их переставить вместе с frame'ом.
+    effective_ids: list[UUID] = sorted(primary_ids, key=lambda i: by_id[i].z_rank)
 
     # Chain of ranks. Cursor moves from after_rank (или None) upward to
     # before_rank (или None).

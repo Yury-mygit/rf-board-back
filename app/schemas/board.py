@@ -131,14 +131,15 @@ class BoardElementZOrderRequest(CamelModel):
     - `before_id` — target(s) кладутся ПОД этим (rank < before_id.z_rank).
     - `after_id` — target(s) кладутся НАД этим (rank > after_id.z_rank).
     - Хотя бы один из двух обязателен (иначе 400).
-    - `cascade_frame` — default True; для UI-drag frame'а несёт children.
-      API-consumers могут послать False (только сам frame).
+
+    BRD-35: `cascade_frame` field удалён. Backend больше не выполняет
+    hidden cascade для frame — caller обязан включить children через
+    `element_ids` explicit'но.
     """
     op: Literal["front", "back", "forward", "backward", "between"]
     element_ids: list[UUID] | None = None
     before_id: UUID | None = None
     after_id: UUID | None = None
-    cascade_frame: bool = True
 
 
 class BoardElementZOrderItem(CamelModel):

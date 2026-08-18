@@ -270,29 +270,31 @@ async def _apply_item(
         for k in ("x", "y", "w", "h"):
             if k in snap:
                 setattr(el, k, snap[k])
+        # BRD-35: legacy `cascade_children` в старых delta rows —
+        # backward compat, продолжаем apply чтобы pre-refactor history
+        # undo работал корректно. Новые actions (после BRD-35) НЕ пишут
+        # cascade_children в delta — каждый child = отдельный item.
         cascade = item.get("cascade_children") or []
-        # На undo cascade содержит before-снимки координат детей.
-        # На redo применяем dx/dy к before-снимку (в snapshot before — оригинал).
-        if direction == "undo":
-            for c in cascade:
-                child = await _get_element(db, c["id"])
-                if child is None or child.deleted_at is not None:
-                    continue
-                child.x = float(c["x"])
-                child.y = float(c["y"])
-                child.updated_at = ts
-        else:
-            # redo: смещение от before-cursor на (after.x - before.x, after.y - before.y).
-            before_pos = item.get("before") or {}
-            dx = float(snap.get("x", 0)) - float(before_pos.get("x", 0))
-            dy = float(snap.get("y", 0)) - float(before_pos.get("y", 0))
-            for c in cascade:
-                child = await _get_element(db, c["id"])
-                if child is None or child.deleted_at is not None:
-                    continue
-                child.x = float(c["x"]) + dx
-                child.y = float(c["y"]) + dy
-                child.updated_at = ts
+        if cascade:
+            if direction == "undo":
+                for c in cascade:
+                    child = await _get_element(db, c["id"])
+                    if child is None or child.deleted_at is not None:
+                        continue
+                    child.x = float(c["x"])
+                    child.y = float(c["y"])
+                    child.updated_at = ts
+            else:
+                before_pos = item.get("before") or {}
+                dx = float(snap.get("x", 0)) - float(before_pos.get("x", 0))
+                dy = float(snap.get("y", 0)) - float(before_pos.get("y", 0))
+                for c in cascade:
+                    child = await _get_element(db, c["id"])
+                    if child is None or child.deleted_at is not None:
+                        continue
+                    child.x = float(c["x"]) + dx
+                    child.y = float(c["y"]) + dy
+                    child.updated_at = ts
         el.updated_at = ts
         return {"element": _el_payload(el)}
 

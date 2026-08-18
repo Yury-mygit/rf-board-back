@@ -146,10 +146,11 @@ async def test_between_multi_select_lands_as_adjacent_block(
 
 # ─── Between: frame cascade с флагом ────────────────────────────────
 
-async def test_between_frame_cascade_true_moves_children(
+async def test_between_frame_with_explicit_children_via_elementIds(
     client, fake_headers, test_board, make_element, db,
 ):
-    """Если target = frame и cascadeFrame=true, children едут с frame."""
+    """BRD-35: layer panel frontend responsibility. Frontend передаёт
+    frame + children явно через `elementIds`. Backend просто applies."""
     a = await make_element(test_board)
     frame = await make_element(test_board, type_="frame", w=400.0, h=300.0)
     child = await make_element(test_board, parent_id=frame)
@@ -159,23 +160,21 @@ async def test_between_frame_cascade_true_moves_children(
         f"/boards/{test_board}/elements/{frame}/z-order",
         headers=fake_headers,
         json={"op": "between", "afterId": str(a), "beforeId": str(b),
-              "cascadeFrame": True},
+              "elementIds": [str(frame), str(child)]},
     )
     assert r.status_code == 200, r.text
     a_r = (await _fresh(db, a)).z_rank
     b_r = (await _fresh(db, b)).z_rank
     frame_r = (await _fresh(db, frame)).z_rank
     child_r = (await _fresh(db, child)).z_rank
-    assert a_r < frame_r < b_r
-    # Child edет вместе — тоже между a и b, но > frame (сохраняя порядок).
-    assert frame_r < child_r
-    assert child_r < b_r
+    assert a_r < frame_r < child_r < b_r
 
 
-async def test_between_frame_cascade_false_moves_only_frame(
+async def test_between_frame_alone_does_not_move_children(
     client, fake_headers, test_board, make_element, db,
 ):
-    """cascadeFrame=False — двигается только frame, child остаётся."""
+    """BRD-35 negative: если caller НЕ передал children в elementIds,
+    backend не двигает их автоматически (hidden cascade убран)."""
     a = await make_element(test_board)
     frame = await make_element(test_board, type_="frame", w=400.0, h=300.0)
     child = await make_element(test_board, parent_id=frame)
@@ -185,12 +184,13 @@ async def test_between_frame_cascade_false_moves_only_frame(
     r = await client.post(
         f"/boards/{test_board}/elements/{frame}/z-order",
         headers=fake_headers,
-        json={"op": "between", "afterId": str(a), "beforeId": str(b),
-              "cascadeFrame": False},
+        json={"op": "between", "afterId": str(a), "beforeId": str(b)},
     )
     assert r.status_code == 200, r.text
     child_r_after = (await _fresh(db, child)).z_rank
-    assert child_r_before == child_r_after
+    assert child_r_before == child_r_after, (
+        "backend cascade должен быть убран (BRD-35)"
+    )
 
 
 # ─── Between: cross-parent warning ──────────────────────────────────
