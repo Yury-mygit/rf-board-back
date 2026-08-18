@@ -321,6 +321,30 @@ async def _apply_item(
         el.updated_at = ts
         return {"element": _el_payload(el)}
 
+    if kind == "mixed":
+        # BRD-29 fix: composite items с несколькими изменившимися полями
+        # (типично для drag child'а из frame — x/y/parent_id меняются
+        # одновременно). Формат snap повторяет singleton mixed
+        # (undo_engine.py:192-208): плоский dict per changed field;
+        # attrs — per-key под ключом "attrs".
+        for k, v in snap.items():
+            if k == "attrs":
+                merged = dict(el.attrs or {})
+                for ak, av in (v or {}).items():
+                    if av is None:
+                        merged.pop(ak, None)
+                    else:
+                        merged[ak] = av
+                el.attrs = merged
+            elif k == "parent_id":
+                el.parent_id = uuid.UUID(v) if v else None
+            elif k == "z_index":
+                el.z_index = int(v) if v is not None else 0
+            else:
+                setattr(el, k, v)
+        el.updated_at = ts
+        return {"element": _el_payload(el)}
+
     return None
 
 
