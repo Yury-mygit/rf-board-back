@@ -588,7 +588,16 @@ async def pop_redoable(
     board_id: uuid.UUID,
     user_uuid: uuid.UUID,
 ) -> BoardAction | None:
-    """SELECT top-1 undone action of user's stack FOR UPDATE."""
+    """SELECT top-1 undone action of user's redo stack FOR UPDATE.
+
+    BRD-33 fix: `ORDER BY ts_ms ASC` (не DESC). Semantic — redo идёт
+    в обратном порядке к undo. Пример: undo снял move2 (последний по
+    ts_ms), потом move1. Redo должен применить move1 первым (последний
+    undone). Move1 имеет меньший ts_ms → ORDER ASC LIMIT 1 → move1.
+
+    Cherry-pick edge cases (mid-stack undo без последующего) LIFO не
+    покрывает — v2, отдельная задача.
+    """
     user_str = str(user_uuid)
     row = (
         await db.execute(
@@ -599,7 +608,7 @@ async def pop_redoable(
                 BoardAction.undone.is_(True),
                 _user_in_associated(user_str),
             )
-            .order_by(BoardAction.ts_ms.desc())
+            .order_by(BoardAction.ts_ms.asc())
             .limit(1)
             .with_for_update()
         )
