@@ -66,7 +66,7 @@ async def board_list_boards(include_deleted: bool = False) -> list[dict]:
             raw = await _api_list_boards(include_deleted=include_deleted, db=db, ctx=ctx)
             return [BoardResponse.model_validate(d).model_dump(mode="json", by_alias=True) for d in raw]
     except APIError as e:
-        raise ValueError(f"{e.code}: {e.message}") from e
+        raise ValueError(f"{e.error}: {e.message}") from e
 
 
 @mcp.tool
@@ -79,7 +79,7 @@ async def board_get(board_id: str) -> dict:
             raw = await _api_get_board(board_id=UUID(board_id), db=db, ctx=ctx)
             return BoardFull.model_validate(raw).model_dump(mode="json", by_alias=True)
     except APIError as e:
-        raise ValueError(f"{e.code}: {e.message}") from e
+        raise ValueError(f"{e.error}: {e.message}") from e
 
 
 @mcp.tool
@@ -131,7 +131,7 @@ async def board_upsert_element_by_ref(
             )
             return BoardElementResponse.model_validate(elem).model_dump(mode="json", by_alias=True)
     except APIError as e:
-        raise ValueError(f"{e.code}: {e.message}") from e
+        raise ValueError(f"{e.error}: {e.message}") from e
 
 
 @mcp.tool
@@ -147,7 +147,7 @@ async def board_delete_element_by_ref(board_id: str, external_ref: str) -> dict:
             )
             return {"ok": True}
     except APIError as e:
-        raise ValueError(f"{e.code}: {e.message}") from e
+        raise ValueError(f"{e.error}: {e.message}") from e
 
 
 @mcp.tool
